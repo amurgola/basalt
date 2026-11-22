@@ -111,7 +111,7 @@ write always leaves 4 GiB of the volume free. After a restart, a prompt that sta
 After the given seconds without requests, the engine frees its VRAM (the driver moves the GPU state to host memory). The process and its
 RAM copy of the experts stay (a dense model has no cache to give back first: the driver moves all its GPU state, both cards' on two cards). The next request wakes it in seconds. Where the driver cannot suspend a process (Windows), a model whose engine moves its own state sleeps the same way:
 Qwen3.8-27B copies its weights, K/V and session state to page-locked RAM, releases their VRAM and puts them back at the same addresses,
-so the conversation in the slot is still there and nothing is read again; the other models stay awake there. The server stays awake when the GPU state would not fit in
+so the conversation in the slot is still there and nothing is read again; the other models stay awake there. Most of such a sleep is taking the page-locked RAM; `--keep-sleep-ram` keeps it after the first sleep, so later sleeps only copy, and that RAM stays taken while the model is awake. The server stays awake when the GPU state would not fit in
 free RAM with 8 GiB to spare. `--idle-unload` ends the process instead.
 
 ## Lending VRAM: `POST /v1/vram`

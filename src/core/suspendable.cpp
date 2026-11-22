@@ -35,6 +35,7 @@ struct Block {
 
 std::mutex mu;
 std::vector<Block> blocks;
+bool keep_host = false;   // --keep-sleep-ram
 
 using Clock = std::chrono::steady_clock;
 double seconds_since(Clock::time_point t0) { return std::chrono::duration<double>(Clock::now() - t0).count(); }
@@ -139,6 +140,19 @@ uint64_t bytes() {
     return n;
 }
 
+void keep_host_memory(bool on) {
+    std::lock_guard<std::mutex> lock(mu);
+    keep_host = on;
+}
+
+uint64_t host_bytes() {
+    std::lock_guard<std::mutex> lock(mu);
+    uint64_t n = 0;
+    for (const Block& b : blocks)
+        if (b.host != nullptr) n += b.bytes;
+    return n;
+}
+
 bool asleep() {
     std::lock_guard<std::mutex> lock(mu);
     return std::any_of(blocks.begin(), blocks.end(), [](const Block& b) { return b.handle == 0; });
@@ -156,7 +170,7 @@ bool sleep(std::string& err) {
         if (b.handle == 0) continue;
         const OnDevice on(b.device);
         const auto t1 = Clock::now();
-        const bool held = cudaDeviceSynchronize() == cudaSuccess && host_alloc(b);
+        const bool held = cudaDeviceSynchronize() == cudaSuccess && (b.host != nullptr || host_alloc(b));
         taking += seconds_since(t1);
         if (!held || !copy(b.host, b.va, b.bytes)) {
             err = held ? "copying the device memory to host memory failed"
@@ -203,11 +217,12 @@ bool wake(std::string& err) {
             err = "copying the sleeping state back to the device failed";
             break;
         }
+        n += b.bytes;
+        if (keep_host) continue;   // the next sleep copies into the same memory
         spent.push_back(b);
         b.host = nullptr;
         b.held = Host::None;
         b.host_mapped = 0;
-        n += b.bytes;
     }
     if (err.empty())
         basalt::log::info("basalt sleep", "%.2f GiB back on the device in %.2f s (%.2f s backing the addresses)",

@@ -86,6 +86,16 @@ int main() {
     if (!suspendable::wake(err)) return fail("the wake after a free", err);
     if (!holds(b, pb) || !holds(s, ps)) return fail("the bytes changed when a sleeping allocation was freed");
 
+    // kept: the host memory of a sleep is still held after the wake, and the next sleep and wake use it
+    if (suspendable::host_bytes() != 0 && !suspendable::sleep(err)) return fail("settling before the kept sleeps", err);
+    suspendable::keep_host_memory(true);
+    if (!suspendable::sleep(err) || !suspendable::wake(err)) return fail("a kept sleep and wake", err);
+    if (suspendable::host_bytes() < odd) return fail("the host memory was not kept over a wake");
+    const std::vector<uint8_t> pc = pattern(odd, 4);
+    if (!put(b, pc) || !suspendable::sleep(err) || !suspendable::wake(err)) return fail("a second kept sleep and wake", err);
+    if (!holds(b, pc)) return fail("the bytes changed over a kept sleep");
+    suspendable::keep_host_memory(false);
+
     if (suspendable::free(b) != cudaSuccess || suspendable::free(s) != cudaSuccess || suspendable::free(nullptr) != cudaSuccess)
         return fail("free");
     if (suspendable::available() || suspendable::bytes() != 0) return fail("an allocation is left");

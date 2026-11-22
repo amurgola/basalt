@@ -81,6 +81,8 @@ struct CommonOptions {
     bool pool_workers_given = false;     // --pool-workers on the command line
     /// Stop when the model emits an end-of-turn token (the pack's own, or --eos-ids).
     bool stop_eos = false;
+    /// --keep-sleep-ram: the page-locked RAM a sleep takes stays taken between sleeps (core::suspendable).
+    bool keep_sleep_ram = false;
     /// --cached-reads: files are read through the OS cache (platform::set_cached_reads).
     bool cached_reads = false;
     /// --ram-reserve-mib: the RAM left free for the rest of the system (platform::ram_reserve); 0 turns the guard off.

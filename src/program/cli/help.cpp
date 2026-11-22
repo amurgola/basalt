@@ -85,6 +85,8 @@ void usage() {
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking (default 2560)\n"
+                 "  --keep-sleep-ram     a model that sleeps by itself keeps the page-locked RAM of its first sleep, so\n"
+                 "                       later sleeps only copy; that RAM stays taken while it is awake (default: given back)\n"
                  "  --cached-reads       read the model file and stored conversations through the OS file cache, so\n"
                  "                       what is already in memory is read from memory (default: around the cache)\n"
                  "  --ram-reserve-mib N  RAM left free for the rest of the system (default 2048); the expert tiers leave\n"
