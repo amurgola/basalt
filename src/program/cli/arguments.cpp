@@ -5,6 +5,7 @@
 #include "basalt/log.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/model/flags.hpp"
+#include "basalt/platform/file.hpp"
 #include "basalt/program/options.hpp"
 
 #include <algorithm>
@@ -71,6 +72,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         }
         else if (a == "--gpu") o.gpu = next("--gpu");
         else if (a == "--gpu-plan") o.gpu_plan = true;
+        else if (a == "--cached-reads") o.cached_reads = true;
         else if (a == "--ppl-base") o.ppl_base = next("--ppl-base");
         else if (a == "--ppl-out") o.ppl_out = next("--ppl-out");
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
@@ -137,6 +139,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         }
     }
     basalt::platform::set_ram_reserve((uint64_t) o.ram_reserve_mib << 20);
+    basalt::platform::set_cached_reads(o.cached_reads);
     if (o.serve && o.ram_reserve_mib == 0 && !o.gpu_plan)
         basalt::log::warn("basalt", "RAM guard off (--ram-reserve-mib 0): low RAM can stop the engine or the machine");
     if (adapter != nullptr)

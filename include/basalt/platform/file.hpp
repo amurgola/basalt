@@ -118,6 +118,10 @@ int open_unbuffered(int fd);
 /// instead.
 int open_unbuffered(const std::string& path);
 
+/// --cached-reads: both `open_unbuffered` forms answer -1 from now on, so every caller reads through the OS cache
+/// and a file whose pages are in memory is read from memory.
+void set_cached_reads(bool on);
+
 /// Creates or truncates `path` for writing, binary, readable and writable by its owner only where the platform has
 /// file modes (a new Windows file takes its folder's inherited access list). A descriptor for `pwrite_all`; -1 on
 /// failure.

@@ -4,6 +4,7 @@
 // made there before; the Windows half is the wide-call form of it, plus what reading a CRT descriptor needs there.
 #include "basalt/platform/file.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -26,6 +27,12 @@
 #endif
 
 namespace basalt::platform {
+
+namespace {
+std::atomic<bool> cached_reads{false};
+}  // namespace
+
+void set_cached_reads(bool on) { cached_reads.store(on); }
 
 #if defined(_WIN32)
 // --------------------------------------------------------------------------------------------- Windows
@@ -219,13 +226,14 @@ void advise_dontneed(int fd, uint64_t off, uint64_t bytes) {
 }
 
 int open_unbuffered(int fd) {
-    if (fd < 0) return -1;
+    if (fd < 0 || cached_reads.load()) return -1;
     const HANDLE original = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
     return direct_descriptor(ReOpenFile(original, GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED));
 }
 
 int open_unbuffered(const std::string& path) {
+    if (cached_reads.load()) return -1;
     return direct_descriptor(CreateFileW(to_wide_path(path).c_str(), GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
         FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr));
@@ -349,7 +357,7 @@ void advise_dontneed(int fd, uint64_t off, uint64_t bytes) {
 }
 
 int open_unbuffered(int fd) {
-    if (fd < 0) return -1;
+    if (fd < 0 || cached_reads.load()) return -1;
     // The descriptor's own path, reopened: /proc/self/fd names the file a descriptor stands for, so this is a second
     // handle on it with the unbuffered flag, and the first keeps its mapping and its cached reads.
     const std::string self = "/proc/self/fd/" + std::to_string(fd);
@@ -359,6 +367,7 @@ int open_unbuffered(int fd) {
 int open_unbuffered(const std::string& path) {
     // The same flag taken from the path directly. A file system that refuses it answers -1, and the caller reads the
     // bytes cached, which is the copy the flag exists to avoid.
+    if (cached_reads.load()) return -1;
     return ::open(path.c_str(), O_RDONLY | O_DIRECT);
 }
 
