@@ -466,7 +466,7 @@ endif()
 # Defined in cmake/platform.cmake, included above with `warnings`.
 
 # ---- core (GPU runtime) ---------------------------------------------
-add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/vmm.cpp src/core/elastic_array.cpp src/core/file_reads.cpp src/core/graph.cpp src/core/weights.cpp src/core/loader.cpp
+add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/vmm.cpp src/core/suspendable.cpp src/core/elastic_array.cpp src/core/file_reads.cpp src/core/graph.cpp src/core/weights.cpp src/core/loader.cpp
                              src/core/host_plan.cpp src/core/checkpoint_transfer.cpp src/core/staged_copy.cpp src/core/prompt_stage.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
@@ -1593,6 +1593,10 @@ add_executable(device_memory_test tests/core/device_memory_test.cpp)
 target_link_libraries(device_memory_test PRIVATE core ${_gpu_runtime_target})
 basalt_gpu_test(NAME device_memory_test COMMAND device_memory_test)
 set_tests_properties(device_memory_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+add_executable(suspendable_test tests/core/suspendable_test.cpp)
+target_link_libraries(suspendable_test PRIVATE core ${_gpu_runtime_target})
+basalt_gpu_test(NAME suspendable_test COMMAND suspendable_test)
+set_tests_properties(suspendable_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 add_executable(shipped_profiles_test tests/core/shipped_profiles_test.cpp)
 target_link_libraries(shipped_profiles_test PRIVATE platform)
 target_include_directories(shipped_profiles_test PRIVATE include)
