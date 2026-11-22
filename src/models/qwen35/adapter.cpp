@@ -4,6 +4,7 @@
 
 #include "basalt/core/diag.hpp"
 #include "basalt/core/on_device.hpp"
+#include "basalt/core/suspendable.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/core/prompt_stage.hpp"
 #include "basalt/core/model_file.hpp"
@@ -126,7 +127,7 @@ class Loaded final : public model::LoadedModel {
 public:
     ~Loaded() override {
         model_.reset();
-        for (auto& [dev, b] : blocks_) cudaFree(b.base);
+        for (auto& [dev, b] : blocks_) basalt::core::suspendable::free(b.base);
         if (embd_) cudaFreeHost(embd_);
     }
 
@@ -384,7 +385,7 @@ private:
 
     void drop_stage() {
         if (auto it = blocks_.find(stage_.device); it != blocks_.end()) {
-            cudaFree(it->second.base);
+            basalt::core::suspendable::free(it->second.base);
             blocks_.erase(it);
         }
         (void) cudaGetLastError();
@@ -495,7 +496,7 @@ private:
         int dev = 0;
         cudaGetDevice(&dev);
         Block& b = blocks_[dev];
-        if (cudaMalloc((void**) &b.base, bytes) != cudaSuccess) {
+        if (basalt::core::suspendable::alloc((void**) &b.base, bytes) != cudaSuccess) {
             (void) cudaGetLastError();
             blocks_.erase(dev);
             err = "qwen35: out of device memory for " + std::to_string((unsigned long long) (bytes >> 20)) + " MiB of weights on CUDA" +

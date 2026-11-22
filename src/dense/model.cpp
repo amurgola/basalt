@@ -1,6 +1,7 @@
 // src/dense/model.cpp - the dense stack's shared scratch and geometry checks.
 #include "internal.hpp"
 
+#include "basalt/core/suspendable.hpp"
 #include "basalt/kernels/gdn_prompt.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/logprobs.hpp"
@@ -18,15 +19,15 @@
 namespace basalt::dense {
 
 Arena::~Arena() {
-    if (base_) cudaFree(base_);
+    if (base_) basalt::core::suspendable::free(base_);
 }
 
 bool Arena::reserve(size_t bytes) {
-    if (base_) cudaFree(base_);
+    if (base_) basalt::core::suspendable::free(base_);
     base_ = nullptr;
     size_ = used_ = 0;
     if (bytes == 0) return true;
-    if (cudaMalloc(&base_, bytes) != cudaSuccess) {
+    if (basalt::core::suspendable::alloc(&base_, bytes) != cudaSuccess) {
         cudaGetLastError();
         base_ = nullptr;
         return false;
@@ -186,7 +187,7 @@ bool decode_drafter(Model& m, std::string& err) {
     auto copy = [&](Linear& l) -> bool {
         if (!q8(l)) return true;
         void* p = nullptr;
-        if (cudaMalloc(&p, bytes(l)) != cudaSuccess) return false;
+        if (basalt::core::suspendable::alloc(&p, bytes(l)) != cudaSuccess) return false;
         m.owned.push_back(p);
         const void* w = l.w;
         const int rows = l.rows, cols = l.cols;
@@ -205,7 +206,7 @@ bool decode_drafter(Model& m, std::string& err) {
         const size_t n = bytes(l);
         tmp_bytes = std::max(tmp_bytes, n);
         void* sc = nullptr;
-        if (cudaMalloc(&sc, 16) != cudaSuccess) return false;
+        if (basalt::core::suspendable::alloc(&sc, 16) != cudaSuccess) return false;
         m.owned.push_back(sc);
         void* w = const_cast<void*>(l.w);
         const int rows = l.rows, cols = l.cols;
@@ -227,8 +228,8 @@ bool decode_drafter(Model& m, std::string& err) {
             for (Linear* l : {&D.k, &D.v}) {
                 void* p = nullptr;
                 void* sc = nullptr;
-                if (!q8(*l) || cudaMalloc(&p, kernels::nvfp4p::bytes(l->rows, l->cols)) != cudaSuccess ||
-                    cudaMalloc(&sc, 16) != cudaSuccess) {
+                if (!q8(*l) || basalt::core::suspendable::alloc(&p, kernels::nvfp4p::bytes(l->rows, l->cols)) != cudaSuccess ||
+                    basalt::core::suspendable::alloc(&sc, 16) != cudaSuccess) {
                     ok = false;
                     break;
                 }
@@ -281,7 +282,7 @@ bool decode_drafter(Model& m, std::string& err) {
     for (const Linear& l : bd.fc) need({&l});
     if (need_p > m.ws.w8.partial_floats || need_t > m.ws.w8.tickets_n) {
         void *p = nullptr, *t = nullptr;
-        if (cudaMalloc(&p, std::max<size_t>(need_p, 1) * 4) != cudaSuccess || cudaMalloc(&t, need_t * 4) != cudaSuccess ||
+        if (basalt::core::suspendable::alloc(&p, std::max<size_t>(need_p, 1) * 4) != cudaSuccess || basalt::core::suspendable::alloc(&t, need_t * 4) != cudaSuccess ||
             cudaMemset(t, 0, need_t * 4) != cudaSuccess) {
             err = m.o.arch + ": out of device memory for the drafter's workspace";
             return false;
@@ -301,9 +302,9 @@ bool decode_drafter(Model& m, std::string& err) {
 bool attach_drafter(Model& m, std::string& err) {
     if (m.drafter_steps.empty()) return true;
     void* tmp = nullptr;
-    bool ok = m.drafter_tmp == 0 || cudaMalloc(&tmp, m.drafter_tmp) == cudaSuccess;
+    bool ok = m.drafter_tmp == 0 || basalt::core::suspendable::alloc(&tmp, m.drafter_tmp) == cudaSuccess;
     for (const auto& step : m.drafter_steps) ok = ok && step(tmp);
-    if (tmp) cudaFree(tmp);
+    if (tmp) basalt::core::suspendable::free(tmp);
     m.drafter_steps.clear();
     if (!ok || cudaDeviceSynchronize() != cudaSuccess) {
         err = m.o.arch + ": laying out the block drafter for decode windows failed";
@@ -384,7 +385,7 @@ Model::~Model() {
     if (stage_side) cudaStreamDestroy(stage_side);
     if (stage_free) cudaEventDestroy(stage_free);
     if (stage_ready) cudaEventDestroy(stage_ready);
-    for (void* p : owned) cudaFree(p);
+    for (void* p : owned) basalt::core::suspendable::free(p);
     vision_detach();
 }
 
@@ -396,7 +397,7 @@ bool Model::vision_attach(int tokens, std::string& err) {
     const size_t need = encoder->arena_bytes(tokens);
     if (enc_arena && enc_bytes >= need) return true;
     vision_detach();
-    if (cudaMalloc(&enc_arena, need) != cudaSuccess) {
+    if (basalt::core::suspendable::alloc(&enc_arena, need) != cudaSuccess) {
         cudaGetLastError();
         enc_arena = nullptr;
         err = o.arch + ": no device memory for the image encoder (" + std::to_string((unsigned long long) (need >> 20)) + " MiB)";
@@ -413,7 +414,7 @@ bool Model::vision_attach(int tokens, std::string& err) {
 void Model::vision_detach() {
     if (!enc_arena) return;
     if (encoder) encoder->detach();
-    cudaFree(enc_arena);
+    basalt::core::suspendable::free(enc_arena);
     enc_arena = nullptr;
     enc_bytes = 0;
 }
@@ -628,11 +629,11 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         // the prompt chunks' VRAM copy of one layer's far cells, laid out as a session's far buffers
         const size_t cells = (size_t) (o.max_context - kept) * g.n_kv * g.head_dim;
         void* p = nullptr;
-        if (cudaMalloc(&p, (size_t) (o.max_context - kept) * cell_bytes(g, o.kv_int8)) != cudaSuccess ||
+        if (basalt::core::suspendable::alloc(&p, (size_t) (o.max_context - kept) * cell_bytes(g, o.kv_int8)) != cudaSuccess ||
             cudaStreamCreateWithFlags(&m->stage_side, cudaStreamNonBlocking) != cudaSuccess ||
             cudaEventCreateWithFlags(&m->stage_free, cudaEventDisableTiming) != cudaSuccess ||
             cudaEventCreateWithFlags(&m->stage_ready, cudaEventDisableTiming) != cudaSuccess) {
-            if (p) cudaFree(p);
+            if (p) basalt::core::suspendable::free(p);
             err = o.arch + ": out of device memory for the streamed K/V's prompt copy";
             return nullptr;
         }

@@ -3,6 +3,7 @@
 
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/on_device.hpp"
+#include "basalt/core/suspendable.hpp"
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/log.hpp"
@@ -539,9 +540,11 @@ public:
     }
 
     // No cache to lend: all it holds is state the driver moves to host memory. Both cards' work is finished first.
-    Result set_low_memory(bool, int64_t&) override {
+    Result set_low_memory(bool low, int64_t&) override {
         cudaStreamSynchronize(st_.stream);
         if (st_.peer) cudaStreamSynchronize(st_.peer->stream);
+        std::string e;
+        if (!(low ? core::suspendable::sleep(e) : core::suspendable::wake(e))) return {Status::Error, m_.o.arch + ": " + e};
         return {};
     }
 
@@ -696,7 +699,8 @@ public:
         const uint64_t host_vision = m_.encoder ? m_.encoder->weights_bytes() : 0;
         return kv + " gpu_weight_bytes=" + std::to_string(m_.o.gpu_weight_bytes) + " host_weight_bytes=0 host_embedding_bytes=" + std::to_string(m_.o.host_embedding_bytes) +
                " host_vision_bytes=" + std::to_string(host_vision) +
-               " " + program::spill_words({}) + (block_ ? " drafter=block" : drafter_ ? " drafter=mtp" : "");
+               " " + program::spill_words({}) + (block_ ? " drafter=block" : drafter_ ? " drafter=mtp" : "") +
+               (core::suspendable::available() ? " sleep=engine" : "");
     }
     int64_t disk_min_tokens() const override { return 4096; }
 
@@ -785,7 +789,7 @@ private:
         const size_t bytes = (size_t) g_.n_vocab * sizeof(float);
         if (dev == nullptr) {
             void* v = nullptr;
-            if (cudaMalloc(&v, bytes) != cudaSuccess) { err = "out of device memory for a logit bias"; return false; }
+            if (basalt::core::suspendable::alloc(&v, bytes) != cudaSuccess) { err = "out of device memory for a logit bias"; return false; }
             owned_.emplace_back(v);
             dev = (float*) v;
         }
@@ -798,7 +802,7 @@ private:
         if (lp_buf_) return true;
         const size_t f = kernels::row_logprobs_scratch_floats(kWindow, g_.n_vocab) + (size_t) kWindow * (kernels::kLogprobStride + 1);
         void* v = nullptr;
-        if (cudaMalloc(&v, f * sizeof(float)) != cudaSuccess) { err = "out of device memory for logprobs"; return false; }
+        if (basalt::core::suspendable::alloc(&v, f * sizeof(float)) != cudaSuccess) { err = "out of device memory for logprobs"; return false; }
         owned_.emplace_back(v);
         lp_buf_ = (float*) v;
         return true;
@@ -836,7 +840,7 @@ private:
             if (history_len_ > kHistoryCap) history_len_ = kHistoryCap;
             if (d_hist_ == nullptr) {
                 void* v = nullptr;
-                if (cudaMalloc(&v, (size_t) kHistoryCap * kWindow * sizeof(int32_t)) != cudaSuccess) { err = "out of device memory for the penalties"; return false; }
+                if (basalt::core::suspendable::alloc(&v, (size_t) kHistoryCap * kWindow * sizeof(int32_t)) != cudaSuccess) { err = "out of device memory for the penalties"; return false; }
                 owned_.emplace_back(v);
                 d_hist_ = (int32_t*) v;
             }
@@ -856,7 +860,7 @@ private:
     }
 
     struct DevFree {
-        void operator()(void* p) const { cudaFree(p); }
+        void operator()(void* p) const { basalt::core::suspendable::free(p); }
     };
 
     static constexpr int kHistoryCap = 4096;

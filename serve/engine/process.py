@@ -663,8 +663,22 @@ class ProcessEngine:
         figures. Caller holds the service FIFO. ValueError carries the engine's refusal."""
         return self._vram_command("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}"), timeout)
 
+    def self_sleeps(self) -> bool:
+        """Whether the engine moves its own GPU state to host memory on SLEEP (INFO sleep=engine)."""
+        return (self.info or {}).get("sleep") == "engine"
+
     def can_sleep(self) -> bool:
-        return suspend.available()
+        return suspend.available() or self.self_sleeps()
+
+    def _back_for_quit(self) -> str | None:
+        """The sleeping engine's GPU state back, so QUIT can run its CUDA calls; None when it is back."""
+        if suspend.available():
+            return suspend.resume(self.proc.pid)
+        try:
+            self._vram_command("WAKE", 120.0)
+            return None
+        except (ValueError, EngineDied) as e:
+            return str(e)
 
     def sleep(self, ram_check=None, timeout: float = 120.0) -> dict:
         """SLEEP: the engine gives its expert cache's VRAM back (its experts stay in RAM), then the driver moves the
@@ -672,6 +686,17 @@ class ProcessEngine:
         why the rest would not fit in RAM (None: it fits). Caller holds the service FIFO and the control lines.
         ValueError: not asleep (the engine is as it was)."""
         with self.sleep_lock:
+            if not suspend.available():              # the engine moves its own state: the RAM is asked first
+                why = ram_check() if ram_check is not None else None
+                if why is not None:
+                    raise ValueError(why)
+                free = {g: vram.free_mib(g) for g in range(vram.gpu_count())}
+                out = self._vram_command("SLEEP", timeout)
+                # what each card gave back is what the wake needs there again
+                gave = {g: (vram.free_mib(g) or 0) - was for g, was in free.items() if was is not None}
+                self.parked = {g: mib for g, mib in gave.items() if mib > 0} or None
+                self.asleep = True
+                return out
             out = self._vram_command("SLEEP", timeout)
             why = ram_check() if ram_check is not None else None
             held = None
@@ -695,6 +720,15 @@ class ProcessEngine:
             if why is not None:
                 raise WakeBlocked(why)
             t = time.time()
+            if not suspend.available():              # the engine puts its own state back
+                try:
+                    out = self._vram_command("WAKE", timeout)
+                except ValueError as e:              # a card has no room: the state stays in host memory
+                    raise WakeBlocked(str(e)) from None
+                finally:
+                    self.restore_s = time.time() - t
+                self.asleep = False
+                return out
             why = suspend.resume(self.proc.pid)
             self.restore_s = time.time() - t
             if why is None:
@@ -1756,7 +1790,7 @@ class ProcessEngine:
         with self.sleep_lock:                        # a sleep in progress ends first
             if self.asleep:                          # its GPU state back first: QUIT runs CUDA calls
                 self.asleep = False
-                if suspend.resume(self.proc.pid) is not None:   # it cannot run, so QUIT would never be answered
+                if self._back_for_quit() is not None:           # it cannot run, so QUIT would never be answered
                     try:
                         self.proc.kill()
                         self.proc.wait(timeout=20)

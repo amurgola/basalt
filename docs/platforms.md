@@ -79,6 +79,7 @@ frames decode on the CPU.
   Whole-expert slices retain their own device aliases; the unregistered tail is locked in the working set.
   Qwen and DeepSeek's resident RAM tiers share CUDA host VMM when supported, with ordinary registration as the fallback.
   Allocation-backed pins stay in RAM across SLEEP/WAKE; the expert caches can still return their VRAM.
+- The driver cannot suspend a process here, so `--idle-sleep` works only for a model whose engine moves its own GPU state to RAM (Qwen3.8-27B); the others stay awake.
 - Large pages need "Lock pages in memory" (Administrators). Without it the engine uses 4 KiB pages and says so at start.
 - No shared arena files and no cgroup limits. `--ple-io direct` reads through the file cache.
 - `basalt serve` runs the Python server as a child.

@@ -16,6 +16,7 @@
 
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/staged_copy.hpp"
+#include "basalt/core/suspendable.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/log.hpp"
@@ -106,7 +107,7 @@ Stage::~Stage() {
             for (int k = 0; k < kSlots; ++k) if (set[k]) cudaEventDestroy(set[k]);
         if (back) cudaEventDestroy(back);
         for (cudaEvent_t e : main_ev) if (e) cudaEventDestroy(e);
-        if (main_mem) cudaFree(main_mem);
+        if (main_mem) basalt::core::suspendable::free(main_mem);
     }
     for (uint8_t* p : hand) if (p) cudaFreeHost(p);
     for (uint8_t* p : kv) if (p) cudaFreeHost(p);
@@ -550,7 +551,7 @@ bool Stage::open(Model& main, int d, int l, const Weights& w, bool split, std::s
     {
         const core::OnDevice on(main_dev);
         const size_t bytes = stage_main_bytes(g, block ? bd : BlockDrafter{});
-        if (cudaMalloc(&main_mem, bytes) != cudaSuccess) {
+        if (basalt::core::suspendable::alloc(&main_mem, bytes) != cudaSuccess) {
             err = "out of device memory for its buffers on the main card";
             return false;
         }

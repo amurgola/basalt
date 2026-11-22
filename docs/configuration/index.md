@@ -66,7 +66,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `open` | server | switch | off | Open the web page when ready. |
 | `lazy` | server | switch | off | Start unloaded; load on the first request. Drops a sidecar encoder. |
 | `idle-unload` | entry | seconds | off | Unload after this long idle. Frees VRAM for other programs. |
-| `idle-sleep` | entry | seconds | off | Sleep after this long idle: VRAM freed, RAM kept, wake in seconds. Linux only. [running](../running.md#sleep---idle-sleep) |
+| `idle-sleep` | entry | seconds | off | Sleep after this long idle: VRAM freed, RAM kept, wake in seconds. Linux; on Windows, Qwen3.8-27B only. [running](../running.md#sleep---idle-sleep) |
 | `min-free-vram-mib` | entry | integer | off | Load an unloaded model only when this much VRAM is free; else 503. |
 | `grammar` | entry | switch (`--no-grammar`) | on | Hold tool calls and JSON formats (`json_object`, `json_schema`) to their schema inside the engine. Without it, other JSON formats are refused with 400. |
 | `max-payload-mib` | server | MiB | `256` | Largest request body the server reads; a bigger one gets a 413. |

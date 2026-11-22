@@ -29,7 +29,8 @@ from serve.config import GRAMMAR_DEFAULT
 
 
 def available_ram_mib() -> int | None:
-    """MemAvailable from /proc/meminfo, in MiB; None where there is no such file."""
+    """The RAM a program can still take, in MiB: MemAvailable from /proc/meminfo, else psutil's figure; None when
+    neither answers."""
     try:
         with open("/proc/meminfo", encoding="ascii") as f:
             for line in f:
@@ -37,7 +38,11 @@ def available_ram_mib() -> int | None:
                     return int(line.split()[1]) >> 10
     except (OSError, ValueError, IndexError):
         pass
-    return None
+    try:
+        import psutil
+        return int(psutil.virtual_memory().available) >> 20
+    except Exception:  # noqa: BLE001 - psutil is optional here
+        return None
 
 
 # trailing effort turn (effort_end): sentences for the non-default efforts
@@ -599,18 +604,19 @@ class Service:
         """Put the model to sleep after idle_sleep_s; `announce` prints the line, naming `name` when given."""
         if not self.idle_sleep_s or not hasattr(self.engine, "sleep"):
             return
-        if not self.engine.can_sleep():
-            print("[server] warning: idle sleep is not available here (the driver cannot suspend a process); "
-                  "use idle_unload", flush=True)
-            return
         if announce:
             print(f"[server] {name or 'model'} sleeps after {self.idle_sleep_s:g} s idle", flush=True)
 
         def loop():
+            told = False
             while True:
                 time.sleep(max(1.0, min(30.0, self.idle_sleep_s / 4)))
                 try:
-                    self.sleep(idle_for=self.idle_sleep_s)
+                    unsupported = self.sleep(idle_for=self.idle_sleep_s) == "unsupported"
+                    if unsupported and not told and self.loaded() and not self.engine.can_sleep():
+                        told = True
+                        print("[server] warning: idle sleep is not available here (neither the driver nor this "
+                              "model's engine can suspend it); use idle_unload", flush=True)
                 except EngineDied as e:                 # the next request starts it again
                     print(f"[server] warning: idle sleep failed ({e})", flush=True)
         threading.Thread(target=loop, daemon=True).start()
