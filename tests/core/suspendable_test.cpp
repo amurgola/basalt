@@ -87,7 +87,12 @@ int main() {
     if (!holds(b, pb) || !holds(s, ps)) return fail("the bytes changed when a sleeping allocation was freed");
 
     // kept: the host memory of a sleep is still held after the wake, and the next sleep and wake use it
-    if (suspendable::host_bytes() != 0 && !suspendable::sleep(err)) return fail("settling before the kept sleeps", err);
+    // a wake leaves its host memory to be given back piece by piece
+    if (suspendable::host_bytes() < odd) return fail("a wake left no host memory to give back");
+    int given = 0;
+    while (suspendable::give_back_one()) ++given;
+    if (given == 0 || suspendable::host_bytes() != 0) return fail("the host memory of a wake was not given back");
+    if (!holds(b, pb)) return fail("the bytes changed when the host memory was given back");
     suspendable::keep_host_memory(true);
     if (!suspendable::sleep(err) || !suspendable::wake(err)) return fail("a kept sleep and wake", err);
     if (suspendable::host_bytes() < odd) return fail("the host memory was not kept over a wake");

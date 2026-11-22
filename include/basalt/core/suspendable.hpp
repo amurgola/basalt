@@ -40,7 +40,11 @@ bool asleep();
 /// --keep-sleep-ram: the host memory a sleep takes stays taken after the wake, so the next sleep only copies.
 /// Taking page-locked memory is most of a sleep; kept, that much RAM stays out of use while the engine is awake.
 void keep_host_memory(bool on);
-/// The host memory held now: the sleeping allocations' copies, and what a wake kept.
+/// The host memory held now: the sleeping allocations' copies, and what a wake left in place.
 uint64_t host_bytes();
+/// Gives back one piece of the host memory a wake left behind; false when there is none left. Giving page-locked
+/// memory back holds up the device's other work, so the serving loop calls this while no request waits, and a
+/// sleep that comes first copies into what is still there.
+bool give_back_one();
 
 }  // namespace basalt::core::suspendable
