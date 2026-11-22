@@ -77,6 +77,19 @@ class IdleSleep(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read().decode())
 
+    def test_the_sleep_route_puts_it_to_sleep_at_once(self):
+        req = urllib.request.Request(self.base + "/v1/sleep", data=b"{}", headers={"Content-Type": "application/json"})
+        with mock.patch.object(self.svc, "_sleep_fits", return_value=None):
+            with urllib.request.urlopen(req, timeout=10) as r:
+                self.assertEqual(json.loads(r.read().decode())["status"], "asleep")
+        self.assertEqual((self.engine.sleeps, self.engine.wakes), (1, 0))
+        self.assertIn(self.chat()["choices"][0]["finish_reason"], ("stop", "length"))
+        self.assertEqual((self.engine.sleeps, self.engine.wakes), (1, 1))
+        with mock.patch.object(self.svc, "_sleep_fits", return_value="RAM: 1 MiB free"):
+            with self.assertRaises(urllib.error.HTTPError) as refused:
+                urllib.request.urlopen(req, timeout=10)
+        self.assertEqual(refused.exception.code, 409)
+
     def test_sleeps_when_idle_and_the_next_request_wakes_it(self):
         self.assertIn(self.chat()["choices"][0]["finish_reason"], ("stop", "length"))
         self.assertEqual(self.svc.sleep(idle_for=3600), "busy")          # a request just now: not idle yet
