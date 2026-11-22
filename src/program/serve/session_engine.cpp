@@ -287,7 +287,8 @@ public:
         const size_t estimate = session().running_bytes() + session().cells_bytes(positions);
         const bool ram_room = !to_disk && conversations->make_room(estimate, held);
         if (!to_disk && !ram_room && disk_wants) to_disk = true;
-        if (to_disk ? disk.queued_bytes() + estimate > kDiskQueueCap : !ram_room) return true;
+        const bool disk_room = disk.queued_bytes() == 0 || disk.queued_bytes() + estimate <= kDiskQueueCap;
+        if (to_disk ? !disk_room : !ram_room) return true;
         const uint64_t floor = std::max<uint64_t>((uint64_t) o.conversation_cache_min_free_mib << 20, disk.enabled() ? disk_floor : 0);
         if (!capture_admit(estimate, floor)) {
             basalt::log::info("basalt serve", "conversation cache: %zu tokens not parked (physical RAM admission)", live.size());

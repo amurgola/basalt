@@ -1084,7 +1084,8 @@ bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
     }
     const uint64_t bytes = image.bytes();
     std::lock_guard<std::mutex> lk(mu_);
-    if (queue_bytes_ + bytes > queue_cap) return false;
+    // the cap bounds what waits behind the writer: one image over it is taken when nothing waits
+    if (queue_bytes_ > 0 && queue_bytes_ + bytes > queue_cap) return false;
     auto job = std::make_shared<Job>();
     job->key = key_of(image.live.ids, image.live.imgs, image.cvec);
     job->name = conversation_name(identity_, job->key);

@@ -522,6 +522,19 @@ int main() {
         CHECK(same_state(got.live, sb.checkpoints[1]) && same_state(got.checkpoints[0], sa.checkpoints[0]));
         remove_dir(d3);
     }
+    {   // one image over the queue's cap is taken when nothing waits behind the writer
+        const std::string d4 = dir + "-cap";
+        {
+            ConversationStore st;
+            st.set_row_cells(4);
+            std::string err;
+            CHECK(st.open(d4, id, 1ull << 30, err));
+            CHECK(st.put(SavedConversation(src), 1));
+            st.flush();
+            CHECK(st.stats().written == 1);
+        }
+        remove_dir(d4);
+    }
     {
         const std::string dir2 = dir + "-rows";
         compressed_rows(dir2);
