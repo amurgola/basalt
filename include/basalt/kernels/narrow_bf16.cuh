@@ -10,6 +10,10 @@
 // (9.0).  Its device pass decodes E2M1 by a byte permute from the eight magnitudes' bit patterns, the sign bit OR'd in
 // (every E2M1 value is exact in f16 and bf16, so these are the instruction's bits), and multiplies by fma.rn.bf16x2 with a
 // -0 addend: x * y + -0 is the exact product rounded once, as mul.rn rounds it (a zero product keeps its sign).
+//
+// Compute capability 8.6 has no E4M3 conversion either.  Its device pass moves a code's exponent and mantissa bits into an
+// f32 and rebiases the exponent with one multiply that keeps subnormals (e4m3_f32_bits), which is the instruction's value;
+// a NaN code (0x7f, 0xff) gives a NaN.
 #pragma once
 
 #include <cuda_runtime.h>
@@ -23,9 +27,15 @@
 #endif
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
-#define BASALT_E2M1_PERMUTE 1   // no E2M1 conversion in this device pass (8.9)
+#define BASALT_E2M1_PERMUTE 1   // no E2M1 conversion in this device pass (8.9, 8.6)
 #else
 #define BASALT_E2M1_PERMUTE 0
+#endif
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+#define BASALT_E4M3_SOFT 1   // no E4M3 conversion in this device pass (8.6)
+#else
+#define BASALT_E4M3_SOFT 0
 #endif
 
 namespace basalt::kernels {
@@ -72,12 +82,43 @@ __device__ __forceinline__ unsigned f16x2_bf16x2(unsigned f) {
     return h;
 }
 
-/// two E4M3 bytes (the low 16 bits of x, the low byte the lower half) as bf16x2 through f16x2
+#if BASALT_E4M3_SOFT
+/// one E4M3 byte (the low byte of x) as the bits of the f32 of its value (exact), without the conversion instruction:
+/// eeee.mmm goes into the f32's exponent and top mantissa bits, and 2^120 moves the bias from 127 to 7 (no .ftz: an E4M3
+/// subnormal is an f32 subnormal here and scales exactly).  A NaN code (0x7f, 0xff) gives a NaN.
+__device__ __forceinline__ unsigned e4m3_f32_bits(unsigned x) {
+    const unsigned em = x & 0x7fu;
+    float f;
+    asm("mul.rn.f32 %0, %1, 0f7B800000;" : "=f"(f) : "f"(__uint_as_float(em << 20)));
+    return em == 0x7fu ? 0x7fffffffu : (__float_as_uint(f) | ((x & 0x80u) << 24));
+}
+
+/// two E4M3 bytes (the low 16 bits of x, the low byte the lower half) as f16x2 (exact), without the conversion instruction
+__device__ __forceinline__ unsigned e4m3x2_f16x2_soft(unsigned x) {
+    unsigned f;
+    asm("{\n"
+        ".reg .f16 l, u;\n"
+        "cvt.rn.f16.f32 l, %1;\n"
+        "cvt.rn.f16.f32 u, %2;\n"
+        "mov.b32 %0, {l, u};\n"
+        "}\n"
+        : "=r"(f)
+        : "f"(__uint_as_float(e4m3_f32_bits(x))), "f"(__uint_as_float(e4m3_f32_bits(x >> 8))));
+    return f;
+}
+#endif
+
+/// two E4M3 bytes (the low 16 bits of x, the low byte the lower half) as bf16x2 through f16x2 (8.6: through f32, whose
+/// top 16 bits are the bf16 of a value bf16 holds exactly)
 __device__ __forceinline__ unsigned e4m3x2_bf16x2_via_f16(unsigned x) {
+#if BASALT_E4M3_SOFT
+    return (e4m3_f32_bits(x) >> 16) | (e4m3_f32_bits(x >> 8) & 0xffff0000u);
+#else
     unsigned f;
     const unsigned short v = (unsigned short) x;
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f) : "h"(v));
     return f16x2_bf16x2(f);
+#endif
 }
 
 /// the four bytes of w, each two E2M1 codes (the low nibble the lower half), as bf16x2 through f16x2

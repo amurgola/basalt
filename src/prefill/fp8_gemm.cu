@@ -26,6 +26,8 @@
 // accumulators.  Its products are exact; its sums run in another order than the block-scaled mma's.
 #include "basalt/prefill/fp8_gemm.hpp"
 
+#include "basalt/kernels/narrow_bf16.cuh"
+
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -371,12 +373,16 @@ struct AdaArgs {
 };
 
 #ifdef FP8_ADA_PASS
-// two E4M3 codes (the low 16 bits of x, the low byte the lower half) as f16x2 (exact)
+// two E4M3 codes (the low 16 bits of x, the low byte the lower half) as f16x2 (exact); 8.6 has no instruction for it
 __device__ __forceinline__ unsigned e4m3x2_f16x2(unsigned x) {
+#if BASALT_E4M3_SOFT
+    return kernels::e4m3x2_f16x2_soft(x);
+#else
     unsigned f;
     const unsigned short v = (unsigned short) x;
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f) : "h"(v));
     return f;
+#endif
 }
 // m16n8k16 f16 x f16 -> f32
 __device__ __forceinline__ void mma_f16(float (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,

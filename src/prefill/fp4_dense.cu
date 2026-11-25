@@ -484,6 +484,7 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
 }
 
 // ---------------------------------------------------------------------------------------- compute capability 8.9
+// (Compute capability 8.6 runs the same kernel with each group's sum on the INT8 tensor cores: e2m1x4_operand, mma_group.)
 // kernel_ada: kernel's product on the FP8 tensor cores, one 16-value scale group per instruction.  Every E2M1 code is an
 // E4M3 value, so each warp turns both operands' codes into E4M3 bytes and runs mma m16n8k16 e4m3 from a zero
 // accumulator for each group: a group's code products are multiples of 1/4 of at most 36, so its sum is exact in the
@@ -527,24 +528,51 @@ __device__ __forceinline__ unsigned prmt(unsigned a, unsigned b, unsigned sel) {
     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(sel));
     return d;
 }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+// Compute capability 8.6 has no E4M3 tensor cores, so a group's sum runs on the INT8 ones.  The four E2M1 codes of the
+// low 16 bits of w (the first value in the lowest nibble) become four int8 bytes of twice their value (0, 1, 2, 3, 4, 6,
+// 8, 12 and their negatives): the magnitude from a table, and a negative code's byte negated.  0x80 - m is at least 0x74,
+// so the subtraction borrows nothing from the next byte, and flipping bit 7 of it gives -m (0 stays 0).
+__device__ __forceinline__ unsigned e2m1x4_operand(unsigned w) {
+    const unsigned mag = prmt(0x03020100u, 0x0c080604u, w & 0x7777u);
+    const unsigned negative = prmt(0u, 0xffffffffu, (w >> 1) & 0x4444u);   // 0xff in the byte of a code with its sign set
+    const unsigned minus = (0x80808080u - mag) ^ 0x80808080u;
+    return mag ^ ((mag ^ minus) & negative);
+}
+#else
 // the four E2M1 codes of the low 16 bits of w (the first value in the lowest nibble) as four E4M3 bytes (exact): the
 // magnitude from a table of the eight values' E4M3 codes, the sign moved from bit 3 of the nibble to bit 7 of the byte
-__device__ __forceinline__ unsigned e2m1x4_e4m3(unsigned w) {
+__device__ __forceinline__ unsigned e2m1x4_operand(unsigned w) {
     const unsigned mag = prmt(0x3c383000u, 0x4c484440u, w & 0x7777u);
     const unsigned sign = prmt(0u, 0x80808080u, (w >> 1) & 0x4444u);
     return mag | sign;
 }
+#endif
 // two UE4M3 scale bytes (the low 16 bits of v) as floats (exact), the low byte in x
 __device__ __forceinline__ float2 ue4m3x2_float2(unsigned v) {
     const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) v, __NV_E4M3);
     return __half22float2(*reinterpret_cast<const __half2*>(&h));
 }
-// d = A (16 tokens x 16 values, E4M3) * B (16 values x 8 weight rows, E4M3), from a zero accumulator
-__device__ __forceinline__ void mma_e4m3(float* d, unsigned a0, unsigned a1, unsigned b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+// d = A (16 tokens x 16 values) * B (16 values x 8 weight rows) of a scale group, from a zero accumulator.  8.6: the int8
+// operands hold twice each code, so the s32 sums are four times the group's (at most 4 * 576, exact) and a quarter of
+// each as fp32 is the number the E4M3 tensor cores give on 8.9: every later operation has the same bits there and here.
+__device__ __forceinline__ void mma_group(float* d, unsigned a0, unsigned a1, unsigned b) {
+    int s[4];
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};\n"
+                 : "=r"(s[0]), "=r"(s[1]), "=r"(s[2]), "=r"(s[3])
+                 : "r"(a0), "r"(a1), "r"(b), "r"(0));
+#pragma unroll
+    for (int i = 0; i < 4; ++i) d[i] = (float) s[i] * 0.25f;
+}
+#else
+// d = A (16 tokens x 16 values, E4M3) * B (16 values x 8 weight rows, E4M3) of a scale group, from a zero accumulator
+__device__ __forceinline__ void mma_group(float* d, unsigned a0, unsigned a1, unsigned b) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};\n"
                  : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
                  : "r"(a0), "r"(a1), "r"(b), "f"(0.0f));
 }
+#endif
 #endif
 
 // the block's row of the warp's 8-row fragment f (SwiGLU: gate fragments 0..3, the same rows' up fragments 4..7)
@@ -648,7 +676,7 @@ __global__ __launch_bounds__(kAdaThreads, 1) void kernel_ada(const __grid_consta
         for (int s = 0; s < 4; ++s) {   // group s: the thread's codes 4c .. 4c + 3 of it, from each of its rows
             const int off = (((s >> 1) ^ half_swap) << 4) + ((s & 1) << 3) + 2 * c;
             const auto codes = [&](const unsigned char* tile, int row) {
-                return e2m1x4_e4m3(*reinterpret_cast<const unsigned short*>(tile + row * 32 + off));
+                return e2m1x4_operand(*reinterpret_cast<const unsigned short*>(tile + row * 32 + off));
             };
             unsigned a[4][2], b[8];
 #pragma unroll
@@ -669,7 +697,7 @@ __global__ __launch_bounds__(kAdaThreads, 1) void kernel_ada(const __grid_consta
 #pragma unroll
                 for (int mt = 0; mt < 4; ++mt) {
                     float d[4];
-                    mma_e4m3(d, a[mt][0], a[mt][1], b[f]);
+                    mma_group(d, a[mt][0], a[mt][1], b[f]);
                     acc[mt][f][0] = fmaf(d[0], ts[2 * mt] * rs[2 * f], acc[mt][f][0]);
                     acc[mt][f][1] = fmaf(d[1], ts[2 * mt] * rs[2 * f + 1], acc[mt][f][1]);
                     acc[mt][f][2] = fmaf(d[2], ts[2 * mt + 1] * rs[2 * f], acc[mt][f][2]);
