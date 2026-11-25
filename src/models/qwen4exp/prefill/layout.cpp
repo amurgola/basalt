@@ -23,6 +23,7 @@
 #include "basalt/log.hpp"
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <string>
@@ -154,14 +155,19 @@ bool fused_layout(size_t T, bool src) {
 struct MoeBufs { size_t gu, h, xq, hq; };
 // An NVFP4 pack's prompt experts run on the FP4 tensor cores: the activation planes, token scales and tile tables sit
 // in Xq (the layer's rows) and Hq (one group's H, a group of up to MMQ_GROUP experts).
-// Only when every card the engine uses has them (compute capability 12.x). The process sees only its own cards
-// (gpu_select's CUDA_VISIBLE_DEVICES), so a Blackwell main card with an Ada tier card reads every prompt chunk through
-// MMQ on both: the buffers, the chunk plan, the peer's share and each row's rounding then do not depend on which card
-// reads a layer, and the decisions made once on the main card (fp4_pack, fp4_every_layer) hold on every card.
+// Only when every card that reads prompt layers has them (compute capability 12.x). The process sees only its own cards
+// (gpu_select's CUDA_VISIBLE_DEVICES), so where an older card reads layers too (a split) every prompt chunk goes through
+// MMQ on all of them: the buffers, the chunk plan and each row's rounding then do not depend on which card reads a
+// layer, and the decisions made once on the main card (fp4_pack, fp4_every_layer) hold on every card.  In gpu-mode peer
+// with an older tier card the tier card reads no layers (Prefill::fp4_by_main_card), so the main card (CUDA 0) decides.
+namespace {
+std::atomic<bool> g_fp4_by_main_card{false};
+}
 bool fp4_tensor_cores() {
     static const bool every = [] {
         int n = 0;
         if (cudaGetDeviceCount(&n) != cudaSuccess || n < 1) { (void) cudaGetLastError(); return false; }
+        if (g_fp4_by_main_card.load(std::memory_order_relaxed)) n = 1;
         for (int dev = 0; dev < n; ++dev) {
             int major = 0;
             if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
@@ -382,6 +388,8 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 int64_t Prefill::chunk() const { return impl_->T; }
 
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
+void Prefill::fp4_by_main_card() { g_fp4_by_main_card.store(true, std::memory_order_relaxed); }
+bool Prefill::fp4_is_by_main_card() { return g_fp4_by_main_card.load(std::memory_order_relaxed); }
 void Prefill::set_stream_all_min(int64_t tokens) { g_stream_all_min = tokens; }
 void Prefill::set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
 void Prefill::set_cpu_share(double share) { impl_->cpu_share_now = std::max(0.0, std::min(share, 1.0)); }

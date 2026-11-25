@@ -2,11 +2,14 @@
 #include "basalt/core/diag.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/core/shipped_profiles.hpp"
+#include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "basalt/platform/file.hpp"
 #include "context.hpp"
 #include "../../../program/generate/run.hpp"
 #include "models/qwen4exp/adapter.hpp"
+
+#include <algorithm>
 
 namespace basalt::models::qwen4exp {
 
@@ -71,6 +74,14 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     if (o.gpus.mode == basalt::program::GpuMode::Peer) {
         o.peer_devices = o.gpus.peers();
         o.peer_device = o.peer_devices.front();
+        // A Blackwell main card with an older tier card (no FP4 tensor cores): the main card keeps its FP4 prompt
+        // kernels and the tier card reads no prompt layers (split_plan). Set before anything sizes the prompt path.
+        const auto& cards = o.gpus.cards;
+        const bool older_tier = !cards.empty() && cards.front().info.cc_major >= 12 &&
+                                std::any_of(cards.begin() + 1, cards.end(), [](const basalt::model::GpuCards::Card& c) {
+                                    return c.info.cc_major > 0 && c.info.cc_major < 12;
+                                });
+        if (older_tier) basalt::prefill::Prefill::fp4_by_main_card();
     }
     // the prompt-time layer split over the expert tier cards (PromptStage), every card a stage; with --batch a read splits
     // only while no slot decodes

@@ -6,6 +6,7 @@
 #include "basalt/core/model_file.hpp"
 #include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/models/qwen4exp/kernels/cvec.hpp"
+#include "basalt/models/qwen4exp/prefill/prefill.hpp"
 
 namespace basalt::models::qwen4exp::generate {
 
@@ -24,9 +25,14 @@ int split_plan(Context& context) {
     // card of gpu, each earlier card the block before it.  Probed before the RAM copy, so the probes' buffers come and go
     // while the RAM is still free.
     std::vector<std::unique_ptr<PromptStage>> pstages;
+    // A tier card without the main card's FP4 tensor cores reads no prompt layers: the main card keeps its FP4 prompt
+    // kernels, which a stage on the older card could not run, and the tier card still computes its experts' rows of a
+    // chunk through MMQ.
+    const bool main_card_fp4 = basalt::prefill::Prefill::fp4_is_by_main_card();
     if (split_want) {
         const char* off = o.peer_exclusive ? "the tier's experts have no RAM copy (--peer-exclusive)"
-                        : !o.resident_cpu_experts ? "no RAM copy of the experts" : nullptr;
+                        : !o.resident_cpu_experts ? "no RAM copy of the experts"
+                        : main_card_fp4 ? "a tier card has no FP4 tensor cores, so the main card reads every layer" : nullptr;
         if (off == nullptr && main_link_gbps <= 0) main_link_gbps = basalt::core::probe_h2d_gbps();   // (a set --pcie-frac skips it)
         for (size_t j = o.peer_devices.size(); off == nullptr && j-- > 0;) {
             auto st = std::make_unique<PromptStage>();
