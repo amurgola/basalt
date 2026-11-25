@@ -1,7 +1,7 @@
 // tests/kernels/fp4_dense_tma_test.cpp - the TMA dense W4A4 product (prefill::fp4_dense) against a double-precision
 // reference over the same quantized codes and scales: the plain product, the Add epilogue and the SwiGLU product; a
 // token's row is the same bits at 1, 1000 and 1100 tokens.  --bench: TFLOP/s at the Qwen3.8-27B MLP shapes against the
-// cp.async path of prefill::fp4::run.  Exit 77 without a GPU.
+// cp.async path of prefill::fp4::run (12.0 only; on 8.9 the product is the FP8-tensor-core kernel).  Exit 77 without a GPU.
 #include "basalt/kernels/nvfp4_planes.hpp"
 #include "basalt/prefill/fp4_dense.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
@@ -289,6 +289,9 @@ int bench() {
     std::mt19937 rng(3);
     std::normal_distribution<float> nd;
     int rc = 0;
+    int major = 0;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
+    const bool old_path = major >= 12;   // prefill::fp4 (the experts' kernels) is sm_120a's alone: 0 ms below it
     for (const int64_t T : {2048, 4096}) {
         std::vector<float> x1((size_t) T * K1), x2((size_t) T * K2);
         for (auto& v : x1) v = nd(rng);
@@ -307,7 +310,7 @@ int bench() {
         cudaMalloc(&toff, 4 * (fp4::kMaxExperts + 1));
         const int32_t b[2] = {0, (int32_t) T};
         cudaMemcpy(bounds, b, 8, cudaMemcpyHostToDevice);
-        fp4::plan(bounds, 1, toff, nullptr);
+        if (old_path) fp4::plan(bounds, 1, toff, nullptr);
 
         const double flop_gu = 2.0 * T * (2 * gate_rows) * K1, flop_d = 2.0 * T * down_rows * K2;
         // the expert path's plain products (gate and up as two of them)
@@ -336,12 +339,15 @@ int bench() {
         fd::quantize(dx2, T, K2, K2, act2, gs, nullptr);
         const float n_d = time_ms([&] { fd::product(wd, dsc + 2, down_rows, K2, act2, gs, T, out2, down_rows, false, nullptr); });
         const float n_da = time_ms([&] { fd::product(wd, dsc + 2, down_rows, K2, act2, gs, T, out2, down_rows, true, nullptr); });
-        fp4::quantize(dx1, nullptr, bounds, toff, 1, a4a, gs, K1, K1, T, nullptr);
-        const float o_gu = time_ms([&] { old_product(cg, cu, gate_rows, K1, a4a, out); });
-        fp4::quantize(dx2, nullptr, bounds, toff, 1, a4b, gs, K2, K2, T, nullptr);
-        const float o_d = time_ms([&] { old_product(cd, nullptr, down_rows, K2, a4b, out2); });
-        const float oq1 = time_ms([&] { fp4::quantize(dx1, nullptr, bounds, toff, 1, a4a, gs, K1, K1, T, nullptr); });
-        const float oq2 = time_ms([&] { fp4::quantize(dx2, nullptr, bounds, toff, 1, a4b, gs, K2, K2, T, nullptr); });
+        float o_gu = 0, o_d = 0, oq1 = 0, oq2 = 0;
+        if (old_path) {
+            fp4::quantize(dx1, nullptr, bounds, toff, 1, a4a, gs, K1, K1, T, nullptr);
+            o_gu = time_ms([&] { old_product(cg, cu, gate_rows, K1, a4a, out); });
+            fp4::quantize(dx2, nullptr, bounds, toff, 1, a4b, gs, K2, K2, T, nullptr);
+            o_d = time_ms([&] { old_product(cd, nullptr, down_rows, K2, a4b, out2); });
+            oq1 = time_ms([&] { fp4::quantize(dx1, nullptr, bounds, toff, 1, a4a, gs, K1, K1, T, nullptr); });
+            oq2 = time_ms([&] { fp4::quantize(dx2, nullptr, bounds, toff, 1, a4b, gs, K2, K2, T, nullptr); });
+        }
         const auto tf = [](double flop, float ms) { return flop / (ms * 1e-3) / 1e12; };
         std::printf("T=%lld  gate+up swiglu [34816 x 5120]: tma %.3f ms (%.0f TFLOP/s)  cp.async %.3f ms (%.0f)\n", (long long) T, n_gu,
                     tf(flop_gu, n_gu), o_gu, tf(flop_gu, o_gu));

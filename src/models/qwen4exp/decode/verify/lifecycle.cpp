@@ -13,6 +13,8 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
 #include "basalt/models/qwen4exp/kernels/mid_chain.hpp"
+#include "basalt/models/qwen4exp/kernels/hc_read_ada.hpp"
+#include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -79,6 +81,9 @@ Verifier::~Verifier() {
     if (lz_s_) cudaStreamDestroy(lz_s_);
     if (lz_fork_) cudaEventDestroy(lz_fork_);
     if (lz_join_) cudaEventDestroy(lz_join_);
+    if (l2a_s_) cudaStreamDestroy(l2a_s_);
+    if (l2a_fork_) cudaEventDestroy(l2a_fork_);
+    if (l2a_join_) cudaEventDestroy(l2a_join_);
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (sh_hi_) cudaStreamDestroy(sh_hi_);
     if (sh_hi2_) cudaStreamDestroy(sh_hi2_);
@@ -116,7 +121,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     basalt::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     basalt::kernels::hc_fused_init();
     basalt::kernels::wait_abort_init();
+    const int mid_ada = exp_flag("mid_ada", 1);   // 0 the separate kernels, 2 the mid chain with z on dense_tc
+    basalt::kernels::mid_chain_ada_enable(mid_ada == 1 || mid_ada == 2, mid_ada == 2);
     basalt::kernels::mid_chain_init();
+    basalt::kernels::hc_read_ada_enable(exp_flag("hc_ada", 1) != 0);   // 0 hc8_gr's three kernels on 8.9
+    basalt::kernels::hc_read_ada_init();
+    solo_stage_ = exp_flag("solo_stage", 0) != 0;   // 1: solo windows send a share of the CPU misses over PCIe too
+    // dm_route_ada=0: the route's one kernel on 8.9
+    basalt::kernels::dec_moe_route_ada_enable(exp_flag("dm_route_ada", 1) != 0, solo_stage_);
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
@@ -224,6 +236,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
         xq_ = b.take<uint8_t>(basalt::kernels::native_q8_1_bytes(max_in, (int) T));
         sh_xq_ = b.take<uint8_t>(basalt::kernels::native_q8_1_bytes(max_in, (int) T));
+        mid_yq_ = b.take<uint8_t>(basalt::kernels::native_q8_1_bytes((int) ZV, (int) T));
         qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
         gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
         z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV);
@@ -313,17 +326,33 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: commit stream create failed";
         return false;
     }
+    // Below compute capability 9.0 the lazy commit stays off (no lz_s_, so lazy_on() is false): its read-ahead blocks
+    // wait on the stop word beside the MoE tail, whose grids fill the card and wait across blocks, and the window
+    // deadlocks; its commit alone, or a read-ahead that does not wait, competes with the MoE tail and costs more than it
+    // saves.  The read-ahead runs alone instead, launched after the MoE grid (l2a_s_).
+    bool lazy_dev = true;
     {
-        int sms = 0;
+        int sms = 0, major = 0;
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device_ >= 0 ? device_ : 0);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_ >= 0 ? device_ : 0);
         fin_blocks_ = sms;
         mid_max_t_ = sms < 160 ? basalt::kernels::kMidChainMaxT : 4;
+        lazy_dev = major >= 9;
+        if (!lazy_dev)
+            basalt::log::info("basalt verify", "lazy GDN commit off, L2 read-ahead after the MoE grid: compute capability %d.x",
+                              major);
     }
     if (!basalt::kernels::gdn_commit_lazy_none(commit_ctl_) ||
-        cudaStreamCreateWithPriority(&lz_s_, cudaStreamNonBlocking, cs_prio) != cudaSuccess ||
+        (lazy_dev && cudaStreamCreateWithPriority(&lz_s_, cudaStreamNonBlocking, cs_prio) != cudaSuccess) ||
         cudaEventCreateWithFlags(&lz_fork_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&lz_join_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: lazy commit stream create failed";
+        return false;
+    }
+    if (!lazy_dev && (cudaStreamCreateWithPriority(&l2a_s_, cudaStreamNonBlocking, cs_prio) != cudaSuccess ||
+                      cudaEventCreateWithFlags(&l2a_fork_, cudaEventDisableTiming) != cudaSuccess ||
+                      cudaEventCreateWithFlags(&l2a_join_, cudaEventDisableTiming) != cudaSuccess)) {
+        err = "verify: L2 read-ahead stream create failed";
         return false;
     }
     *(volatile uint32_t*) h_pend_ = 0;

@@ -17,6 +17,13 @@
 // ends), the consumers write their rounded values into the tile and TMA stores write it out, so no thread waits on a
 // load or a store of its own; the tile's token scales are copied into shared memory at the block's start for the same
 // reason.  FP32 outputs go straight from the accumulators.
+//
+// Compute capability 8.9 has neither TMA, mbarrier transaction counts nor the block-scaled form, and its plain e4m3 mma keeps
+// fewer bits than fp32 in its sums, even inside one k32 step (1.5e-4 of sum |w a| at K 6144 against 1e-5 here, Hopper's
+// known FP8 accumulation).  There gemm_ada_kernel decodes the codes to f16 (every E4M3 value is exact in f16) and runs the
+// product on mma m16n8k16 with fp32 accumulation: the block tile, the eight warps over it, the K loop in order, the same
+// epilogue arithmetic; stages of 64 K filled by cp.async from every thread, and the BF16 outputs go straight from the
+// accumulators.  Its products are exact; its sums run in another order than the block-scaled mma's.
 #include "basalt/prefill/fp8_gemm.hpp"
 
 #include <cuda.h>
@@ -30,6 +37,11 @@
 
 #include "basalt/log.hpp"
 
+// the device pass is below compute capability 9.0 (8.9): the TMA kernel traps and the Ada kernel has its body
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+#define FP8_ADA_PASS 1
+#endif
+
 namespace basalt::prefill::fp8 {
 namespace {
 
@@ -42,7 +54,9 @@ constexpr int ACT_BYTES = ST * BT * BK, W_BYTES = ST * BR * BK;
 // A block's BF16 output tile takes the weight stages' memory: slabs of SLAB_ROWS rows (128 bytes a token)
 constexpr int SLAB_ROWS = 64, SLABS = BR / SLAB_ROWS, SLAB_BYTES = BT * SLAB_ROWS * 2;
 constexpr int OUT_BYTES = SLABS * SLAB_BYTES;
+#ifndef FP8_ADA_PASS
 constexpr int FETCH_STAGES = 6;                         // stages before the K loop's end an Add asks for its residual lines
+#endif
 static_assert(OUT_BYTES <= W_BYTES && WROW == SLAB_ROWS && MR == 8, "a warp's rows are one slab, its fragments the slab's 16-byte pieces");
 // the stages, the barriers (full and empty per stage, the output tile's two), the tile's token scales
 constexpr int SMEM = ACT_BYTES + W_BYTES + (2 * ST + 2) * 8 + BT * 4;
@@ -82,6 +96,7 @@ struct Args {
 };
 
 __device__ __forceinline__ unsigned su(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
+#ifndef FP8_ADA_PASS   // the TMA kernel's helpers (its body is a trap in an 8.9 pass)
 __device__ __forceinline__ void ldsm4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned a) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
 }
@@ -124,16 +139,20 @@ __device__ __forceinline__ void stores_read() {
     asm volatile("cp.async.bulk.commit_group;" ::: "memory");
     asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
 }
+// byte offset of (row, logical byte) in a 128-byte-row tile the TMA wrote with the 128-byte swizzle
+__device__ __forceinline__ int sw(int row, int byte) { return row * BK + (byte ^ ((row & 7) << 4)); }
+#endif
 // 16 bytes to shared memory, the first `n` of them from src and zeros after
 __device__ __forceinline__ void cp16z(void* dst, const void* src, int n) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(su(dst)), "l"(src), "r"(n) : "memory");
 }
-// byte offset of (row, logical byte) in a 128-byte-row tile the TMA wrote with the 128-byte swizzle
-__device__ __forceinline__ int sw(int row, int byte) { return row * BK + (byte ^ ((row & 7) << 4)); }
 
 // BF16: the outputs are BF16 (Store rounds the product, Add widens the BF16 residual, adds in fp32 and rounds once)
 template <bool BF16>
 __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Args p) {
+#ifdef FP8_ADA_PASS
+    __trap();   // never launched below compute capability 9.0 (gemm_segmented takes gemm_ada_kernel there)
+#else
     extern __shared__ __align__(1024) unsigned char raw[];
     unsigned char* act = raw;
     unsigned char* wt = raw + ACT_BYTES;
@@ -333,6 +352,156 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
                 }
             }
     }
+#endif
+}
+
+// ---------------------------------------------------------------------------------------- compute capability 8.9
+constexpr int A_BK = 64, A_ST = 4;                       // K per stage (bytes per row), stages
+constexpr int A_ACT = BT * A_BK, A_STAGE = A_ACT + BR * A_BK;
+constexpr int A_SMEM = A_ST * A_STAGE;
+static_assert(A_SMEM <= 99 * 1024 && (BT * 4) % NCONS == 0 && (BR * 4) % NCONS == 0, "the Ada stages");
+
+struct AdaArgs {
+    const uint8_t* act;          // the activation codes [ntok][K]
+    const uint8_t* w[MAX_SEG];   // each segment's weight codes [rows][K]
+    Seg seg[MAX_SEG];
+    const float* a_scale;
+    int64_t K;
+    int nseg, ntok, tok_tiles, k_tiles, epi;
+};
+
+#ifdef FP8_ADA_PASS
+// two E4M3 codes (the low 16 bits of x, the low byte the lower half) as f16x2 (exact)
+__device__ __forceinline__ unsigned e4m3x2_f16x2(unsigned x) {
+    unsigned f;
+    const unsigned short v = (unsigned short) x;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f) : "h"(v));
+    return f;
+}
+// m16n8k16 f16 x f16 -> f32
+__device__ __forceinline__ void mma_f16(float (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
+                                        unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+#endif
+// byte offset of (row, logical byte) in a stage tile of 64-byte rows: the 16-byte pieces swizzled by (row / 2) % 4, so
+// the eight rows of an ldmatrix matrix fall in eight bank groups
+__device__ __forceinline__ int swa(int row, int byte) {
+    return row * A_BK + ((((byte >> 4) ^ (row >> 1)) & 3) << 4) + (byte & 15);
+}
+
+template <bool BF16>
+__global__ void __launch_bounds__(NCONS, 1) gemm_ada_kernel(const __grid_constant__ AdaArgs p) {
+#ifndef FP8_ADA_PASS
+    __trap();   // 9.0 and up run gemm_kernel
+#else
+    extern __shared__ __align__(128) unsigned char raw[];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wtk = warp / WR, wrw = warp % WR;
+    const int row_tile = blockIdx.x / p.tok_tiles, tok_tile = blockIdx.x - row_tile * p.tok_tiles;
+    int si = 0;
+    for (int i = 1; i < p.nseg; ++i)
+        if (row_tile >= p.seg[i].tile0) si = i;
+    const int row0 = (row_tile - p.seg[si].tile0) * BR, tok0 = tok_tile * BT;
+    const Seg sg = p.seg[si];
+    const uint8_t* wsrc = p.w[si];
+    // stage st <- K tile kt: the activation rows' four 16-byte pieces, then the weight rows' (zeros past the tensors)
+    const auto load = [&](int kt, int st) {
+        unsigned char* as = raw + st * A_STAGE;
+        unsigned char* ws = as + A_ACT;
+        const int64_t k0 = (int64_t) kt * A_BK;
+#pragma unroll
+        for (int i = 0; i < BT * 4 / NCONS; ++i) {
+            const int idx = tid + i * NCONS, r = idx >> 2, pc = idx & 3, t = tok0 + r;
+            const bool ok = t < p.ntok;
+            cp16z(as + swa(r, pc * 16), p.act + (int64_t) (ok ? t : 0) * p.K + k0 + pc * 16, ok ? 16 : 0);
+        }
+#pragma unroll
+        for (int i = 0; i < BR * 4 / NCONS; ++i) {
+            const int idx = tid + i * NCONS, r = idx >> 2, pc = idx & 3, wr = row0 + r;
+            const bool ok = wr < sg.rows;
+            cp16z(ws + swa(r, pc * 16), wsrc + (int64_t) (ok ? wr : 0) * p.K + k0 + pc * 16, ok ? 16 : 0);
+        }
+    };
+    float acc[MT][MR][4] = {};
+    const int g = lane >> 2, c = lane & 3;
+#pragma unroll
+    for (int st = 0; st < A_ST - 1; ++st) {
+        if (st < p.k_tiles) load(st, st);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    }
+#pragma unroll 1
+    for (int kt = 0; kt < p.k_tiles; ++kt) {
+        asm volatile("cp.async.wait_group %0;" ::"n"(A_ST - 2) : "memory");
+        __syncthreads();   // stage kt is in, and every warp has left stage kt - 1, which the next load refills
+        if (kt + A_ST - 1 < p.k_tiles) load(kt + A_ST - 1, (kt + A_ST - 1) % A_ST);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+        const unsigned char* as = raw + (kt % A_ST) * A_STAGE;
+        const unsigned char* ws = as + A_ACT;
+        // four k16 steps: thread (g, c) takes values 16c .. 16c + 15 of the stage for its rows, step s's k-slots {2c, 2c+1}
+        // values 16c + 4s, +1 and {2c+8, 2c+9} values 16c + 4s + 2, +3 (one 4-byte read a row a step), the same for both
+#pragma unroll
+        for (int s = 0; s < A_BK / 16; ++s) {
+            unsigned af[MT][4];
+#pragma unroll
+            for (int mt = 0; mt < MT; ++mt) {
+                const int r = wtk * WTOK + mt * 16 + g;
+                const unsigned w0 = *reinterpret_cast<const unsigned*>(as + swa(r, 16 * c + 4 * s));
+                const unsigned w1 = *reinterpret_cast<const unsigned*>(as + swa(r + 8, 16 * c + 4 * s));
+                af[mt][0] = e4m3x2_f16x2(w0);
+                af[mt][1] = e4m3x2_f16x2(w1);
+                af[mt][2] = e4m3x2_f16x2(w0 >> 16);
+                af[mt][3] = e4m3x2_f16x2(w1 >> 16);
+            }
+#pragma unroll
+            for (int mr = 0; mr < MR; ++mr) {   // each weight fragment decoded right before its products
+                const unsigned w = *reinterpret_cast<const unsigned*>(ws + swa(wrw * WROW + mr * 8 + g, 16 * c + 4 * s));
+                const unsigned b0 = e4m3x2_f16x2(w), b1 = e4m3x2_f16x2(w >> 16);
+#pragma unroll
+                for (int mt = 0; mt < MT; ++mt) mma_f16(acc[mt][mr], af[mt][0], af[mt][1], af[mt][2], af[mt][3], b0, b1);
+            }
+        }
+    }
+    const float ws = sg.scale ? *sg.scale : 1.0f;
+    const bool add = p.epi == (int) Epilogue::Add || p.epi == (int) Epilogue::AddBf16;
+    // gemm_kernel's epilogue arithmetic, a token row at a time (with Add, its residual pairs loaded before any is written)
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int tk = tok0 + wtk * WTOK + mt * 16 + (lane >> 2) + h * 8;
+            if (tk >= p.ntok) continue;
+            const float as = __ldg(p.a_scale + tk);
+            float2 res[MR];
+#pragma unroll
+            for (int mr = 0; mr < MR; ++mr) {
+                const int r = row0 + wrw * WROW + mr * 8 + 2 * (lane & 3);
+                res[mr] = make_float2(0.0f, 0.0f);
+                if (add && r < sg.rows) {
+                    if constexpr (BF16)
+                        res[mr] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(
+                            static_cast<const __nv_bfloat16*>(sg.dst) + (int64_t) tk * sg.ld + r));
+                    else
+                        res[mr] = __ldcg(reinterpret_cast<const float2*>(static_cast<const float*>(sg.dst) + (int64_t) tk * sg.ld + r));
+                }
+            }
+#pragma unroll
+            for (int mr = 0; mr < MR; ++mr) {
+                const int r = row0 + wrw * WROW + mr * 8 + 2 * (lane & 3);
+                if (r >= sg.rows) continue;
+                // rounded products, then the add: no contraction into an fma, so the bits do not depend on the instance
+                float2 v = make_float2(__fmul_rn(__fmul_rn(acc[mt][mr][2 * h], as), ws),
+                                       __fmul_rn(__fmul_rn(acc[mt][mr][2 * h + 1], as), ws));
+                if (add) v = make_float2(__fadd_rn(res[mr].x, v.x), __fadd_rn(res[mr].y, v.y));
+                if constexpr (BF16)
+                    *reinterpret_cast<__nv_bfloat162*>(static_cast<__nv_bfloat16*>(sg.dst) + (int64_t) tk * sg.ld + r) =
+                        __floats2bfloat162_rn(v.x, v.y);
+                else
+                    *reinterpret_cast<float2*>(static_cast<float*>(sg.dst) + (int64_t) tk * sg.ld + r) = v;
+            }
+        }
+#endif
 }
 
 size_t scale_off(int64_t rows, int64_t cols) { return ((size_t) rows * (size_t) cols + 15) & ~(size_t) 15; }
@@ -504,11 +673,78 @@ void tmap_out(TmaDesc* out, void* dst, int64_t rows, int64_t tokens, int64_t ld)
 }
 }  // namespace
 
+// the current device has TMA and the block-scaled mma (compute capability 9.0 and up: the build's 12.0), per device
+static bool tma_device() {
+    static std::atomic<signed char> known[64];   // per device: 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return true; }
+    signed char k = known[dev].load(std::memory_order_acquire);
+    if (k == 0) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return true;
+        }
+        k = major >= 9 ? 2 : 1;
+        known[dev].store(k, std::memory_order_release);
+    }
+    return k == 2;
+}
+
+// gemm_segmented below compute capability 9.0 (the checks done)
+static void gemm_ada(const Segment* seg, int nseg, int64_t w_cols, const void* act, int64_t rows, Epilogue epi, cudaStream_t stream) {
+    static std::atomic<bool> raised[64];   // the shared-memory opt-in, per device
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) ck("device");
+    if (!raised[dev].load(std::memory_order_acquire)) {
+        if (cudaFuncSetAttribute(gemm_ada_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A_SMEM) != cudaSuccess ||
+            cudaFuncSetAttribute(gemm_ada_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A_SMEM) != cudaSuccess) {
+            basalt::log::error("basalt", "prefill fp8: shared-memory opt-in failed");
+            std::exit(1);
+        }
+        raised[dev].store(true, std::memory_order_release);
+    }
+    AdaArgs p{};
+    p.act = (const uint8_t*) act;
+    int tiles = 0;
+    for (int i = 0; i < nseg; ++i) {
+        p.w[i] = seg[i].w;
+        p.seg[i] = {seg[i].w_scale, seg[i].dst, seg[i].ld_dst, (int) seg[i].rows, tiles};
+        tiles += (int) ((seg[i].rows + BR - 1) / BR);
+    }
+    p.a_scale = (const float*) ((const uint8_t*) act + scale_off(rows, w_cols));
+    p.K = w_cols;
+    p.nseg = nseg;
+    p.ntok = (int) rows;
+    p.tok_tiles = (int) ((rows + BT - 1) / BT);
+    p.k_tiles = (int) (w_cols / A_BK);   // w_cols is a multiple of 64
+    p.epi = (int) epi;
+    if (epi == Epilogue::StoreBf16 || epi == Epilogue::AddBf16)
+        gemm_ada_kernel<true><<<(unsigned) (tiles * p.tok_tiles), NCONS, A_SMEM, stream>>>(p);
+    else
+        gemm_ada_kernel<false><<<(unsigned) (tiles * p.tok_tiles), NCONS, A_SMEM, stream>>>(p);
+    ck("gemm (8.9)");
+}
+
 void gemm_segmented(const Segment* seg, int nseg, int64_t w_cols, const void* act, int64_t rows, Epilogue epi, void* stream) {
     if (rows <= 0 || nseg < 1) return;
     if (nseg > MAX_SEG || w_cols % 64 != 0) {
         basalt::log::error("basalt", "prefill fp8: %d segments of %lld columns", nseg, (long long) w_cols);
         std::exit(1);
+    }
+    if (!tma_device()) {
+        const bool bf16 = epi == Epilogue::StoreBf16 || epi == Epilogue::AddBf16;
+        for (int i = 0; i < nseg; ++i) {   // gemm_segmented's contract (the Ada kernel needs less of it)
+            const Segment& s = seg[i];
+            if (s.rows <= 0 || s.rows % 128 != 0 || ((uintptr_t) s.w & 15) != 0 || ((uintptr_t) s.dst & (bf16 ? 15 : 7)) != 0 ||
+                s.ld_dst % (bf16 ? 8 : 2) != 0 || s.ld_dst < s.rows) {
+                basalt::log::error("basalt", "prefill fp8: segment %d: [%lld x %lld] matrix, ld %lld", i, (long long) s.rows,
+                                   (long long) w_cols, (long long) s.ld_dst);
+                std::exit(1);
+            }
+        }
+        gemm_ada(seg, nseg, w_cols, act, rows, epi, (cudaStream_t) stream);
+        return;
     }
     static std::atomic<bool> raised[64];   // the shared-memory opt-in is per device
     int dev = 0;

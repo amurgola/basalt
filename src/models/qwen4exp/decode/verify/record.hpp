@@ -25,6 +25,7 @@ struct Verifier::WindowRecorder {
     bool gdn(int64_t l, const LayerView& v, bool read_q8, bool gs_split);
     bool qsa(int64_t l, const LayerView& v, bool read_q8);
     bool post(int64_t l);
+    void l2_ahead(int64_t l);
     bool head();
     float* Rt(int t) const { return v_.R_ + (size_t) t * HC * N; }
     void stamp(int64_t l, int i) const {
@@ -58,18 +59,17 @@ struct Verifier::WindowRecorder {
     const bool pdl = v_.pdl_rec_ && !v_.prof_on_;
     // the chain's kernels let their dependents in early (pdl.hpp), which stage their weights
     const bool pdl2 = pdl && kernels::pdl2_requested();
-    const int hrow0 = v_.batch_rec_ ? v_.row_base_ : 0;   // a slot group's own hand-off rows
 
     bool ple_side = false;
     bool ple_open = false;   // the PLE side branch is forked and not joined yet
     const int32_t* pos_k = nullptr;
     const int32_t* pos_i = nullptr;
-    const int64_t HB = Verifier::handoff_floats(g);
     std::vector<int64_t> gdn_idx, qsa_idx;
     int64_t gdn_first = -1;
     bool lazy = false;
     kernels::GdnCommitLayers lazy_args{};
     bool lz_open = false;   // a lazy launch not joined yet
+    bool l2a_open = false;   // an l2_ahead launch not joined yet
     bool ring_fork = false;   // the group's ring stream is joined in post
     int mid_ord = 0;   // the mid chain's launches so far in this graph
     bool glue_on = false;   // post's gate/up launch plans the group's VRAM share

@@ -1,0 +1,18 @@
+{
+  "engine": {
+    "resident-experts": true
+  },
+  "models": [
+    {
+      "gpu": "0",
+      "kv": "int8",
+      "max-context": 70000,
+      "model": "models/Qwen3.8-FN-NVFP4.basalt"
+    }
+  ],
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8080
+  },
+  "version": 2
+}

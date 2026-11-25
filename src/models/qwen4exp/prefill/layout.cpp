@@ -21,6 +21,7 @@
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/models/qwen4exp/prefill/kernels.hpp"
 #include "basalt/log.hpp"
+#include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -153,10 +154,30 @@ bool fused_layout(size_t T, bool src) {
 struct MoeBufs { size_t gu, h, xq, hq; };
 // An NVFP4 pack's prompt experts run on the FP4 tensor cores: the activation planes, token scales and tile tables sit
 // in Xq (the layer's rows) and Hq (one group's H, a group of up to MMQ_GROUP experts).
+// Only when every card the engine uses has them (compute capability 12.x). The process sees only its own cards
+// (gpu_select's CUDA_VISIBLE_DEVICES), so a Blackwell main card with an Ada tier card reads every prompt chunk through
+// MMQ on both: the buffers, the chunk plan, the peer's share and each row's rounding then do not depend on which card
+// reads a layer, and the decisions made once on the main card (fp4_pack, fp4_every_layer) hold on every card.
+bool fp4_tensor_cores() {
+    static const bool every = [] {
+        int n = 0;
+        if (cudaGetDeviceCount(&n) != cudaSuccess || n < 1) { (void) cudaGetLastError(); return false; }
+        for (int dev = 0; dev < n; ++dev) {
+            int major = 0;
+            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return false;
+            }
+            if (major < 12) return false;
+        }
+        return true;
+    }();
+    return every;
+}
 bool fp4_pack() {
     static const bool any = [] {
         const auto& lay = basalt::kernels::cpu::expert_layout();
-        if (!lay.native) return false;
+        if (!lay.native || !fp4_tensor_cores()) return false;
         for (const auto& f : lay.fmt)
             if (f.gu_type == GGML_TYPE_NVFP4 && f.d_type == GGML_TYPE_NVFP4 && f.tail != 0) return true;
         return false;
@@ -176,7 +197,8 @@ bool fp4_every_layer() {
     static const bool all = [] {
         const auto& lay = basalt::kernels::cpu::expert_layout();
         const MmqPlan& mp = mmq_plan();
-        if (!lay.native || lay.fmt.empty() || !mp.any || mp.layer.size() < lay.fmt.size()) return false;
+        if (!lay.native || lay.fmt.empty() || !mp.any || mp.layer.size() < lay.fmt.size() || !fp4_tensor_cores())
+            return false;
         for (size_t l = 0; l < lay.fmt.size(); ++l)
             if (!mp.layer[l] || lay.fmt[l].gu_type != GGML_TYPE_NVFP4 || lay.fmt[l].d_type != GGML_TYPE_NVFP4 ||
                 lay.fmt[l].tail == 0)

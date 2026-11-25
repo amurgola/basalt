@@ -5,13 +5,59 @@ namespace basalt::kernels {
 
 int dec_moe_route_blocks(int n_tok, int n_embd) { return 1 + (n_tok * n_embd + kDmThreads - 1) / kDmThreads; }
 
+namespace {
+bool g_dm_ada_on = false;
+bool g_dm_ada_stage = false;
+
+bool dm_ada_device() {
+    static signed char known[16] = {};   // 0: not asked yet, 1: compute capability 8.9, -1: another
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) return false;
+    if (known[dev] == 0) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        known[dev] = major == 8 && minor == 9 ? 1 : -1;
+    }
+    return known[dev] > 0;
+}
+
+// the two kernels' case: no peer, no shared gate, x in 16-byte units (a staged share, when enabled, takes their kStage
+// instances)
+bool dm_ada_args(const DmRouteArgs& a) {
+    auto al16 = [](const void* p) { return p != nullptr && ((uintptr_t) p & 15u) == 0; };
+    return g_dm_ada_on && (a.mode == 1 || a.mode == 2) && a.res1 == nullptr && a.n_x == 0 && a.peer_cap == 0 &&
+           (a.stage_src == nullptr || (g_dm_ada_stage && a.stage_k != nullptr)) && a.sh_gw == nullptr && !a.kinds &&
+           a.pub_ctr == nullptr && al16(a.x) && al16(a.x_m) && (!a.rows || al16(a.xq_m)) && dm_ada_device();
+}
+}  // namespace
+
+void dec_moe_route_ada_enable(bool on, bool staged) {
+    g_dm_ada_on = on;
+    g_dm_ada_stage = staged;
+}
+
+bool dec_moe_route_ada(const DmRouteArgs& a) { return dm_ada_args(a); }
+
 void dec_moe_route(const DmRouteArgs& a, void* stream) {
     if (a.n_tok * a.k > kDmCap || a.n_embd % kDmThreads != 0) {
         basalt::log::error("basalt", "dec_moe_route: %d entries / n_embd %d", a.n_tok * a.k, a.n_embd);
         std::exit(1);
     }
     const dim3 grid((unsigned) dec_moe_route_blocks(a.n_tok, a.n_embd));
-    dm_route_kernel<<<grid, kDmThreads, 0, (cudaStream_t) stream>>>(a);
+    if (dm_ada_args(a)) {
+        const dim3 rg = a.rows ? grid : dim3(1);
+        if (a.stage_src != nullptr) {
+            if (a.mode == 1) dm_plan_ada_kernel<true><<<grid, kDmThreads, 0, (cudaStream_t) stream>>>(a);
+            else dm_ring_ada_kernel<true><<<rg, kDmThreads, 0, (cudaStream_t) stream>>>(a);
+        } else {
+            if (a.mode == 1) dm_plan_ada_kernel<false><<<grid, kDmThreads, 0, (cudaStream_t) stream>>>(a);
+            else dm_ring_ada_kernel<false><<<rg, kDmThreads, 0, (cudaStream_t) stream>>>(a);
+        }
+    } else {
+        dm_route_kernel<<<grid, kDmThreads, 0, (cudaStream_t) stream>>>(a);
+    }
     check("dec_moe_route");
 }
 

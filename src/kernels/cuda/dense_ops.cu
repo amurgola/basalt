@@ -1,6 +1,7 @@
 // src/kernels/cuda/dense_ops.cu - see include/basalt/kernels/dense_ops.hpp.
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
+#include "basalt/kernels/kv_fp4.cuh"
 #include "basalt/kernels/pdl.hpp"
 #include "philox.cuh"
 
@@ -10,9 +11,16 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include "basalt/log.hpp"
+
+// Thread-block clusters exist from compute capability 9.0: below it (the 8.9 build, or a device pass under 9.0) the
+// cluster form of the GDN gating product traps and gdn_gating_proj launches its flat form (the same bits).
+#if defined(BASALT_ARCH_BELOW_SM90) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900)
+#define GP_NO_CLUSTER 1
+#endif
 
 namespace basalt::kernels {
 namespace {
@@ -283,13 +291,21 @@ __global__ void __launch_bounds__(128) f32_rows_dot_kernel(const float* __restri
 // Adapted from Infernix (Ian Ranson and contributors), Apache-2.0: see THIRD_PARTY_LICENSES - its
 // bf16_gdn_gating_proj_gemm_mma fuses the same gating into the a/b projection's epilogue over a split K.
 constexpr int GP_AHEAD = 1;   // K / GP_S must be a multiple of 32 GP_AHEAD
-constexpr int GP_HV = 48, GP_S = 8, GP_TT = 64, GP_LD = 2 * GP_HV + 8, GP_NF = 2 * GP_HV / 8;
+[[maybe_unused]] constexpr int GP_HV = 48, GP_S = 8, GP_TT = 64, GP_LD = 2 * GP_HV + 8, GP_NF = 2 * GP_HV / 8;
+#ifdef GP_NO_CLUSTER
+#define GP_CLUSTER_DIMS   // no cluster attribute below compute capability 9.0; the kernel traps if it is ever launched
+#else
+#define GP_CLUSTER_DIMS __cluster_dims__(1, 1, GP_S)
+#endif
 // In: FP32 x (two BF16 terms) or BF16 x (exact: one term)
 template <class In>
-__global__ void __cluster_dims__(1, 1, GP_S) __launch_bounds__(128)
+__global__ void GP_CLUSTER_DIMS __launch_bounds__(128)
     gdn_gating_proj_kernel(const In* __restrict__ x, const uint16_t* __restrict__ w, const float* __restrict__ dt,
                            const float* __restrict__ ssm_a, float* __restrict__ gate, float* __restrict__ beta, int64_t T,
                            int64_t K) {
+#ifdef GP_NO_CLUSTER
+    __trap();
+#else
     namespace cg = cooperative_groups;
     __shared__ __align__(16) float part[GP_TT * GP_LD];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
@@ -390,7 +406,118 @@ __global__ void __cluster_dims__(1, 1, GP_S) __launch_bounds__(128)
         beta[t * GP_HV + h] = 1.0f / (1.0f + __expf(-b));
     }
     cluster.sync();   // no block leaves while another still reads its partial sums
+#endif
 }
+
+// The flat form, below compute capability 9.0: a block of GP_S warps per 16 tokens, warp q running the cluster form's
+// rank q (its K slice: the cluster kernel's loop, copied, so the cluster kernel's own source and its 12.0 code stay
+// upstream's) for the same 16 tokens; the GP_S partial sums meet in shared memory and add in rank order, and the gates
+// are the same expressions, so every gate is the cluster form's arithmetic.  12.0 runs the cluster form.
+template <class In>
+__global__ void __launch_bounds__(32 * GP_S)
+    gdn_gating_proj_flat_kernel(const In* __restrict__ x, const uint16_t* __restrict__ w, const float* __restrict__ dt,
+                                const float* __restrict__ ssm_a, float* __restrict__ gate, float* __restrict__ beta,
+                                int64_t T, int64_t K) {
+#ifndef GP_NO_CLUSTER
+    __trap();
+#else
+    __shared__ __align__(16) float part[GP_S][16][2 * GP_HV];   // 48 KiB
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
+    const int rank = warp;
+    const int64_t tile0 = (int64_t) blockIdx.x * 16, t0 = tile0;
+    const int64_t kslice = K / GP_S, kbeg = rank * kslice;
+    const int64_t ta = min(t0 + g, T - 1), tb = min(t0 + g + 8, T - 1);
+    // thread c reads 8 consecutive k per 32 (an mma step takes them as the pairs 0,1 and 2,3: the k order inside a step is
+    // free), so the four lanes of a row read 128 contiguous bytes of x and 64 of w, one wide load each
+    const In* xa = x + ta * K + kbeg + 8 * c;
+    const In* xb = x + tb * K + kbeg + 8 * c;
+    const uint16_t* wp = w + (int64_t) g * K + kbeg + 8 * c;   // row 8 j + g of the 96
+    float acc[GP_NF][4] = {};
+    float4 qx[GP_AHEAD][4];   // the loads run GP_AHEAD steps of 32 k ahead of the products (a register queue)
+    uint4 qw[GP_AHEAD][GP_NF];
+    auto fetch = [&](int d, int64_t k) {
+        if constexpr (sizeof(In) == 4) {
+            qx[d][0] = *reinterpret_cast<const float4*>(xa + k);
+            qx[d][1] = *reinterpret_cast<const float4*>(xa + k + 4);
+            qx[d][2] = *reinterpret_cast<const float4*>(xb + k);
+            qx[d][3] = *reinterpret_cast<const float4*>(xb + k + 4);
+        } else {   // the eight BF16 values as raw bits in the first two queue slots
+            const uint4 ua = *reinterpret_cast<const uint4*>(xa + k), ub = *reinterpret_cast<const uint4*>(xb + k);
+            qx[d][0] = *reinterpret_cast<const float4*>(&ua);
+            qx[d][2] = *reinterpret_cast<const float4*>(&ub);
+        }
+#pragma unroll
+        for (int j = 0; j < GP_NF; ++j) qw[d][j] = *reinterpret_cast<const uint4*>(wp + (int64_t) 8 * j * K + k);
+    };
+    auto bf2 = [](float lo, float hi) { return __floats2bfloat162_rn(lo, hi); };
+    auto bits = [](__nv_bfloat162 v) { return *reinterpret_cast<unsigned*>(&v); };
+#pragma unroll
+    for (int d = 0; d < GP_AHEAD; ++d) fetch(d, 32 * d);
+    for (int64_t k = 0; k < kslice; k += 32 * GP_AHEAD) {
+#pragma unroll
+        for (int d = 0; d < GP_AHEAD; ++d) {
+            float4 fx[4];
+            uint4 wv[GP_NF];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) fx[i] = qx[d][i];
+#pragma unroll
+            for (int j = 0; j < GP_NF; ++j) wv[j] = qw[d][j];
+            if (k + 32 * (GP_AHEAD + d) < kslice) fetch(d, k + 32 * (GP_AHEAD + d));
+#pragma unroll
+            for (int step = 0; step < 2; ++step) {   // x = hi + lo, both BF16 (about 17 bits of x), one m16n8k16 each
+                if constexpr (sizeof(In) == 2) {   // BF16 x: the codes themselves, one term
+                    const uint4 ua = *reinterpret_cast<const uint4*>(&fx[0]), ub = *reinterpret_cast<const uint4*>(&fx[2]);
+                    const unsigned h0 = step ? ua.z : ua.x, h1 = step ? ub.z : ub.x, h2 = step ? ua.w : ua.y, h3 = step ? ub.w : ub.y;
+#pragma unroll
+                    for (int j = 0; j < GP_NF; ++j) {
+                        const unsigned b0 = step ? wv[j].z : wv[j].x, b1 = step ? wv[j].w : wv[j].y;
+                        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                     : "+f"(acc[j][0]), "+f"(acc[j][1]), "+f"(acc[j][2]), "+f"(acc[j][3])
+                                     : "r"(h0), "r"(h1), "r"(h2), "r"(h3), "r"(b0), "r"(b1));
+                    }
+                    continue;
+                }
+                const float4 xa4 = fx[step], xb4 = fx[2 + step];
+                const __nv_bfloat162 ha0 = bf2(xa4.x, xa4.y), ha1 = bf2(xa4.z, xa4.w);
+                const __nv_bfloat162 hb0 = bf2(xb4.x, xb4.y), hb1 = bf2(xb4.z, xb4.w);
+                const unsigned hi0 = bits(ha0), hi1 = bits(hb0), hi2 = bits(ha1), hi3 = bits(hb1);
+                const unsigned lo0 = bits(bf2(xa4.x - __low2float(ha0), xa4.y - __high2float(ha0)));
+                const unsigned lo1 = bits(bf2(xb4.x - __low2float(hb0), xb4.y - __high2float(hb0)));
+                const unsigned lo2 = bits(bf2(xa4.z - __low2float(ha1), xa4.w - __high2float(ha1)));
+                const unsigned lo3 = bits(bf2(xb4.z - __low2float(hb1), xb4.w - __high2float(hb1)));
+#pragma unroll
+                for (int j = 0; j < GP_NF; ++j) {
+                    const unsigned b0 = step ? wv[j].z : wv[j].x, b1 = step ? wv[j].w : wv[j].y;
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                 : "+f"(acc[j][0]), "+f"(acc[j][1]), "+f"(acc[j][2]), "+f"(acc[j][3])
+                                 : "r"(lo0), "r"(lo1), "r"(lo2), "r"(lo3), "r"(b0), "r"(b1));
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                 : "+f"(acc[j][0]), "+f"(acc[j][1]), "+f"(acc[j][2]), "+f"(acc[j][3])
+                                 : "r"(hi0), "r"(hi1), "r"(hi2), "r"(hi3), "r"(b0), "r"(b1));
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < GP_NF; ++j) {
+        *reinterpret_cast<float2*>(&part[warp][g][8 * j + 2 * c]) = make_float2(acc[j][0], acc[j][1]);
+        *reinterpret_cast<float2*>(&part[warp][g + 8][8 * j + 2 * c]) = make_float2(acc[j][2], acc[j][3]);
+    }
+    __syncthreads();
+    for (int idx = tid; idx < 16 * GP_HV; idx += 32 * GP_S) {
+        const int tl = idx / GP_HV, h = idx % GP_HV;
+        float a = 0.f, b = 0.f;
+#pragma unroll
+        for (int q = 0; q < GP_S; ++q) { a += part[q][tl][h]; b += part[q][tl][GP_HV + h]; }
+        const int64_t t = tile0 + tl;
+        if (t >= T) continue;
+        const float v = a + dt[h];
+        gate[t * GP_HV + h] = (v > 20.0f ? v : log1pf(__expf(v))) * ssm_a[h];
+        beta[t * GP_HV + h] = 1.0f / (1.0f + __expf(-b));
+    }
+#endif
+}
+
 
 // Block (row t, head j): j < n_head a query head, else a key/value head; one thread per head dim.
 __device__ __forceinline__ float ldf(const float* p) { return *p; }
@@ -431,6 +558,11 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
         }
         y = d < half ? y * cs - xs[d + half] * sn : y * cs + xs[d - half] * sn;
     }
+    // an NVFP4 cache holds the keys turned by the Hadamard transform, so the queries read against it are turned too (the
+    // transform is orthonormal: every dot product is the same); the whole block takes this branch or none of it
+    if constexpr (HDW == 256) {
+        if (q8.fp4) y = kv4_hadamard256(y, xs, d);
+    }
     if (is_q) {
         stf(q_out + (t * n_head + head) * HDW + d, y);
         return;
@@ -447,6 +579,23 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
         return;
     }
     if (fa) q8 = far_kv.q8;
+    if (q8.fp4) {
+        // NVFP4: per 16 values (16 lanes of a warp) the E4M3 scale amax / 6, each value the nearest E2M1 code against the
+        // decoded scale; a lane pair packs its two codes into one byte, the even dim in the low nibble
+        const int64_t row = cell * n_kv + head;
+        const uint32_t sk = kv4_group_scale(kv4_amax16(y)), sv = kv4_group_scale(kv4_amax16(vv));
+        const uint32_t ck = kv4_group_code(y, kv4_e4m3_value(sk)), cv = kv4_group_code(vv, kv4_e4m3_value(sv));
+        const uint32_t nk = __shfl_down_sync(0xffffffffu, ck, 1), nv = __shfl_down_sync(0xffffffffu, cv, 1);
+        if ((d & 1) == 0) {
+            reinterpret_cast<uint8_t*>(q8.k)[row * (HDW / 2) + d / 2] = (uint8_t) (ck | (nk << 4));
+            reinterpret_cast<uint8_t*>(q8.v)[row * (HDW / 2) + d / 2] = (uint8_t) (cv | (nv << 4));
+        }
+        if ((d & 15) == 0) {
+            reinterpret_cast<uint8_t*>(q8.ks)[row * (HDW / 16) + d / 16] = (uint8_t) sk;
+            reinterpret_cast<uint8_t*>(q8.vs)[row * (HDW / 16) + d / 16] = (uint8_t) sv;
+        }
+        return;
+    }
     // int8: per 64 values, scale = amax / 127 (stored fp16), codes rounded to nearest against the stored scale; a group
     // is two warps: each warp's max by shuffles, then the pair's (a max is exact in any order)
     float ak = fabsf(y), av = fabsf(vv);
@@ -709,6 +858,35 @@ void f32_rows_dot(const float* x, const float* w, float* y, int64_t T, int64_t N
     check("f32_rows_dot");
 }
 
+// the current device has thread-block clusters (compute capability 9.0+), per device
+static bool gp_clusters() {
+    static std::atomic<signed char> known[64];   // per device: 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return false; }
+    signed char k = known[dev].load(std::memory_order_acquire);
+    if (k == 0) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        k = major >= 9 ? 2 : 1;
+        known[dev].store(k, std::memory_order_release);
+    }
+    return k == 2;
+}
+
+template <class In>
+static void gating_launch(const In* x, const uint16_t* w_ab, const float* dt, const float* ssm_a, float* gate, float* beta,
+                          int64_t T, int64_t K, void* stream) {
+    if (gp_clusters())
+        gdn_gating_proj_kernel<In><<<dim3((unsigned) ((T + GP_TT - 1) / GP_TT), 1, GP_S), 128, 0, (cudaStream_t) stream>>>(
+            x, w_ab, dt, ssm_a, gate, beta, T, K);
+    else
+        gdn_gating_proj_flat_kernel<In><<<(unsigned) ((T + 15) / 16), 32 * GP_S, 0, (cudaStream_t) stream>>>(
+            x, w_ab, dt, ssm_a, gate, beta, T, K);
+}
+
 void gdn_gating_proj(const float* x, const uint16_t* w_ab, const float* dt, const float* ssm_a, float* gate, float* beta,
                      int64_t T, int64_t HV, int64_t K, void* stream) {
     if (T <= 0) return;
@@ -716,8 +894,7 @@ void gdn_gating_proj(const float* x, const uint16_t* w_ab, const float* dt, cons
         basalt::log::error("basalt", "gdn_gating_proj: HV %lld K %lld", (long long) HV, (long long) K);
         std::exit(1);
     }
-    gdn_gating_proj_kernel<float><<<dim3((unsigned) ((T + GP_TT - 1) / GP_TT), 1, GP_S), 128, 0, (cudaStream_t) stream>>>(
-        x, w_ab, dt, ssm_a, gate, beta, T, K);
+    gating_launch<float>(x, w_ab, dt, ssm_a, gate, beta, T, K, stream);
     check("gdn_gating_proj");
 }
 void gdn_gating_proj(const uint16_t* x, const uint16_t* w_ab, const float* dt, const float* ssm_a, float* gate, float* beta,
@@ -727,8 +904,7 @@ void gdn_gating_proj(const uint16_t* x, const uint16_t* w_ab, const float* dt, c
         basalt::log::error("basalt", "gdn_gating_proj: HV %lld K %lld", (long long) HV, (long long) K);
         std::exit(1);
     }
-    gdn_gating_proj_kernel<__nv_bfloat16><<<dim3((unsigned) ((T + GP_TT - 1) / GP_TT), 1, GP_S), 128, 0, (cudaStream_t) stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x), w_ab, dt, ssm_a, gate, beta, T, K);
+    gating_launch<__nv_bfloat16>(reinterpret_cast<const __nv_bfloat16*>(x), w_ab, dt, ssm_a, gate, beta, T, K, stream);
     check("gdn_gating_proj");
 }
 

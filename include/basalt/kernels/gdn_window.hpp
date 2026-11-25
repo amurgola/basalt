@@ -6,7 +6,8 @@
 //
 // A window never writes the recurrent state, so a rejected draft never touches it and nothing is snapshotted.  Every
 // value is the one the per-stage kernels produce (the same operations on the same values in the same order), so a
-// token's outputs do not depend on T or its column.  Needs thread-block clusters.
+// token's outputs do not depend on T or its column.  Needs thread-block clusters (compute capability 9.0 and up),
+// except the split forms (dec_gdn_rec_split, dec_gdn_rec_seg_split, dec_gdn_gates), which run on any card.
 //
 // Geometry: state size 128; key and value heads, the block width (a multiple of 256 up to 5120) and the output
 // gate's activation (GdnGate) are the model's.  State layout [S rows][h_v][S cols] fp32, then the conv history
@@ -59,7 +60,8 @@ struct DecRecArgs {
 /// The block widths dec_gdn_rec is built for.
 bool dec_gdn_rec_supported(int n_embd);
 /// The recurrence of tokens [0, n_tok) from the untouched state; one cluster of four blocks per value head (of the
-/// head map's value heads when a.nk > 0).
+/// head map's value heads when a.nk > 0).  Below compute capability 9.0 it runs as dec_gdn_rec_split and dec_gdn_rec_norm
+/// (the same bits, state_out included), the raw output in a.o or else a.y (one of them must be set there).
 void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream);
 
 /// A window of several sequences ("segments"): each segment is n consecutive rows with its own GDN state.  The table
@@ -103,8 +105,9 @@ void dec_gdn_rec_split(const DecRecArgs& a, int n_tok, void* stream);
 void dec_gdn_rec_norm(const DecRecArgs& a, int n_tok, void* stream);
 /// The verify window's GDN block around native q8_1 + qkv/z/out projections, as run: dec_gdn_rec_split beside the z
 /// projection (z forked after the q8_1, beside qkv too), then dec_gdn_rec_norm.  Mode 1 is dec_gdn_rec after z, 2 forks
-/// z after qkv.
-inline constexpr int dec_gdnf_mode() { return 3; }
+/// z after qkv.  The fused recurrence runs on thread-block clusters, so a card below compute capability 9.0 (Ada) gets
+/// mode 0: the callers then take the per-stage kernels (gdn_conv_l2_multi, gdn_ab_multi, gdn_step_norm_multi).
+int dec_gdnf_mode();
 
 /// history <- the last 3 entries of [history | qkv_0 .. qkv_{n-1}], n = *n_keep (0 leaves it as it was).
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream);

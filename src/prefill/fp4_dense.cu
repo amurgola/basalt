@@ -11,6 +11,10 @@
 // asked for a few stages before the K loop ends), the consumers write their rounded values into the tile and TMA
 // stores write it out, so no thread waits on a load or a store of its own; the tile's token scales are copied into
 // shared memory at the block's start for the same reason.  FP32 outputs go straight from the accumulators.
+//
+// Compute capability 8.9 has no FP4 tensor cores, TMA or mbarrier transaction counts: there kernel_ada runs the product on
+// the FP8 tensor cores, one scale group per instruction (see its comment), and the quantizer rounds to E2M1 without the
+// FP4 convert.
 #include "basalt/prefill/fp4_dense.hpp"
 
 #include "basalt/kernels/silu.cuh"
@@ -29,6 +33,11 @@
 
 #include "basalt/log.hpp"
 
+// the device pass is below compute capability 9.0 (8.9): the TMA kernel traps and kernel_ada has its body
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+#define FP4_ADA_PASS 1
+#endif
+
 namespace basalt::prefill::fp4_dense {
 namespace {
 
@@ -39,7 +48,7 @@ constexpr int kConsumerWarps = 8;         // 4 token quarters x 2 row halves
 constexpr int kProducerThreads = 128;     // one warpgroup, so setmaxnreg can move registers to the consumers
 constexpr int kThreads = kConsumerWarps * 32 + kProducerThreads;
 constexpr int kWarpTokens = kBT / 4, kWarpRows = kBR / 2;
-constexpr int kMmaTokens = kWarpTokens / 16, kMmaRows = kWarpRows / 8;
+[[maybe_unused]] constexpr int kMmaTokens = kWarpTokens / 16, kMmaRows = kWarpRows / 8;
 constexpr int kK64 = 2;                   // 64-value MMA steps per stage (stage K = 128)
 constexpr int kScaleSlots = (kStages + 2) / 2;   // an activation scale tile (256 values) serves two stages
 constexpr int kScaleTileBytes = kBT * 16;        // 256 tokens x 16 groups
@@ -54,6 +63,8 @@ void ck(cudaError_t e, const char* what) {
 // ------------------------------------------------------------------------------------------------- device
 
 __device__ __forceinline__ uint32_t smem_addr(const void* p) { return (uint32_t) __cvta_generic_to_shared(p); }
+
+#ifndef FP4_ADA_PASS   // the TMA kernel's helpers (its body is a trap in an 8.9 pass)
 
 __device__ __forceinline__ void mbar_init(uint64_t* b, uint32_t n) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_addr(b)), "r"(n) : "memory");
@@ -121,6 +132,8 @@ __device__ __forceinline__ void mma_fp4(float* c, const unsigned* a, unsigned b0
                    "r"(sfb), "h"(kId), "h"(kId));
 }
 
+#endif
+
 // A tensor map as a kernel argument: the descriptor type is aligned more strictly than the hardware needs on newer
 // toolkits and a by-value argument with that alignment is not representable on every host compiler, so the argument
 // carries the bytes at the boundary the hardware requires and the kernel reads them as descriptors.
@@ -158,8 +171,8 @@ constexpr int kSmem = (int) sizeof(Shared);
 static_assert(kSmem <= 99 * 1024, "one block's shared memory");
 // A block's BF16 output tile takes the code stages' memory once the K loop is over: slabs of kSlabRows rows (128 bytes
 // a token).
-constexpr int kSlabRows = 64, kSlabBytes = kBT * kSlabRows * 2;
-constexpr int kFetchStages = 12;   // stages before the K loop's end an Add asks for its residual lines
+[[maybe_unused]] constexpr int kSlabRows = 64, kSlabBytes = kBT * kSlabRows * 2;
+[[maybe_unused]] constexpr int kFetchStages = 12;   // stages before the K loop's end an Add asks for its residual lines
 static_assert(offsetof(Shared, a_codes) == 0 && offsetof(Shared, b_codes) == sizeof(Shared::a_codes), "the code stages are one run");
 static_assert(kBT * kBR * 2 <= (int) (sizeof(Shared::a_codes) + sizeof(Shared::b_codes)), "the output tile fits the code stages");
 static_assert(kWarpRows == kSlabRows && kMmaRows == 8, "a warp's rows are one slab, its fragments the slab's 16-byte pieces");
@@ -174,6 +187,9 @@ template <int N, class F> __device__ __forceinline__ void with_live(int live, F&
 // BF: the plain product's dst is BF16, rounded once (Add widens it, adds in fp32 and rounds once).
 template <bool SWIGLU, bool ADD, bool BF = false>
 __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Params p) {
+#ifdef FP4_ADA_PASS
+    __trap();   // never launched below compute capability 9.0 (launch takes kernel_ada there)
+#else
     constexpr int branches = SWIGLU ? 2 : 1;
     constexpr int loaded_rows = kBR / branches;
     extern __shared__ __align__(128) unsigned char shared_bytes[];
@@ -464,6 +480,274 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
                 }
             }
     }
+#endif
+}
+
+// ---------------------------------------------------------------------------------------- compute capability 8.9
+// kernel_ada: kernel's product on the FP8 tensor cores, one 16-value scale group per instruction.  Every E2M1 code is an
+// E4M3 value, so each warp turns both operands' codes into E4M3 bytes and runs mma m16n8k16 e4m3 from a zero
+// accumulator for each group: a group's code products are multiples of 1/4 of at most 36, so its sum is exact in the
+// MMA's accumulator.  That sum times the token's and the row's group scales is added into fp32 with one fma, group after
+// group in K order, so a token's row keeps one order at any chunk length.  The block tile is 128 tokens x 256 weight
+// rows (SwiGLU: 128 gate rows and the same 128 up rows), eight warps as 2 (tokens) x 4 (rows) of 64 x 64, K in stages of
+// 64 values (four groups; four stages, filled by cp.async from every thread).  In step s of a stage thread (g, c) gives
+// the MMA values 16s + 4c .. 16s + 4c + 3 of its rows, a 16-bit load of four codes; a row's two 16-byte halves are
+// swapped in every other group of four rows, so the eight rows of a load fall in different banks.  At each stage's start
+// a warp turns the group scales of its 64 tokens and 64 rows into fp32 in its own shared memory.  The epilogues are
+// kernel's arithmetic, from the accumulators to global memory.
+constexpr int kAdaBT = 128, kAdaBR = 256, kAdaStages = 4, kAdaThreads = 256;
+constexpr int kAdaACodes = kAdaBT * 32, kAdaBCodes = kAdaBR * 32;               // a stage's 64 values: 32 code bytes a row
+constexpr int kAdaAScales = kAdaBT * 4, kAdaBScales = kAdaBR * 4;               // and four scale bytes
+constexpr int kAdaStage = kAdaACodes + kAdaBCodes + kAdaAScales + kAdaBScales;  // 13,824 bytes
+constexpr int kAdaWarpScales = 2 * 4 * 64;   // a warp's group scales of a stage in fp32: its 64 tokens and 64 rows, 4 groups
+constexpr int kAdaSmem = kAdaStages * kAdaStage + kAdaThreads / 32 * kAdaWarpScales * 4;
+
+struct AdaParams {
+    const uint8_t* a_codes;    // [tokens][K / 2]
+    const uint8_t* a_scales;   // the scale tiles (act_bytes)
+    const uint8_t* w[2];       // the plane matrices (SwiGLU: gate, up)
+    const float* gs;
+    const float* ws[2];        // the matrix scales
+    float* dst;                // the plain product's output (FP32, or BF16 under BF)
+    __nv_bfloat16* hdst;       // SwiGLU's output (BF16)
+    float* amax;               // SwiGLU (optional)
+    int64_t ld, rows, K;
+    int tokens, tok_tiles;
+};
+
+#ifdef FP4_ADA_PASS
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, int n) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(smem_addr(dst)), "l"(src), "r"(n) : "memory");
+}
+__device__ __forceinline__ void cp_async4(void* dst, const void* src, int n) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(smem_addr(dst)), "l"(src), "r"(n) : "memory");
+}
+__device__ __forceinline__ unsigned prmt(unsigned a, unsigned b, unsigned sel) {
+    unsigned d;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(sel));
+    return d;
+}
+// the four E2M1 codes of the low 16 bits of w (the first value in the lowest nibble) as four E4M3 bytes (exact): the
+// magnitude from a table of the eight values' E4M3 codes, the sign moved from bit 3 of the nibble to bit 7 of the byte
+__device__ __forceinline__ unsigned e2m1x4_e4m3(unsigned w) {
+    const unsigned mag = prmt(0x3c383000u, 0x4c484440u, w & 0x7777u);
+    const unsigned sign = prmt(0u, 0x80808080u, (w >> 1) & 0x4444u);
+    return mag | sign;
+}
+// two UE4M3 scale bytes (the low 16 bits of v) as floats (exact), the low byte in x
+__device__ __forceinline__ float2 ue4m3x2_float2(unsigned v) {
+    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) v, __NV_E4M3);
+    return __half22float2(*reinterpret_cast<const __half2*>(&h));
+}
+// d = A (16 tokens x 16 values, E4M3) * B (16 values x 8 weight rows, E4M3), from a zero accumulator
+__device__ __forceinline__ void mma_e4m3(float* d, unsigned a0, unsigned a1, unsigned b) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};\n"
+                 : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+                 : "r"(a0), "r"(a1), "r"(b), "f"(0.0f));
+}
+#endif
+
+// the block's row of the warp's 8-row fragment f (SwiGLU: gate fragments 0..3, the same rows' up fragments 4..7)
+template <bool SWIGLU> __device__ __forceinline__ int ada_row(int wrw, int f) {
+    if constexpr (SWIGLU) return f < 4 ? 32 * wrw + 8 * f : kAdaBR / 2 + 32 * wrw + 8 * (f - 4);
+    else return 64 * wrw + 8 * f;
+}
+
+template <bool SWIGLU, bool ADD, bool BF = false>
+__global__ __launch_bounds__(kAdaThreads, 1) void kernel_ada(const __grid_constant__ AdaParams p) {
+#ifndef FP4_ADA_PASS
+    __trap();   // 9.0 and up run kernel
+#else
+    extern __shared__ __align__(128) unsigned char smem[];
+    constexpr int loaded = SWIGLU ? kAdaBR / 2 : kAdaBR;   // the rows a block reads of each matrix
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, c = lane & 3;
+    const int wtk = warp >> 2, wrw = warp & 3;
+    const int tok_tile = (int) blockIdx.x % p.tok_tiles;
+    const int64_t row_begin = (int64_t) ((int) blockIdx.x / p.tok_tiles) * loaded;
+    const int token_begin = tok_tile * kAdaBT;
+    const int64_t K = p.K, half = K / 2;
+    const int ktiles = (int) (K / 64);
+    const size_t scale_off = (size_t) p.rows * (size_t) half;   // nvfp4p::scale_offset
+    // stage st <- K tile kt (values 64 kt ..): codes and scales, zeros past the tokens and the rows; a row's 16-byte
+    // halves (groups 0, 1 and 2, 3) trade places when bit 2 of the row is set
+    const auto load = [&](int kt, int st) {
+        unsigned char* ac = smem + st * kAdaStage;
+        unsigned char* bc = ac + kAdaACodes;
+        unsigned char* asc = bc + kAdaBCodes;
+        unsigned char* bsc = asc + kAdaAScales;
+        {
+            const int r = tid >> 1, pc = tid & 1, t = token_begin + r;
+            const bool ok = t < p.tokens;
+            const uint8_t* src = p.a_codes + (int64_t) (ok ? t : 0) * half + kt * 32 + pc * 16;
+            cp_async16(ac + r * 32 + (pc ^ ((r >> 2) & 1)) * 16, src, ok ? 16 : 0);
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int idx = tid + i * kAdaThreads, r = idx >> 1, pc = idx & 1;
+            const int m = SWIGLU ? r / loaded : 0;
+            const int64_t wr = row_begin + (SWIGLU ? r % loaded : r);
+            const bool ok = wr < p.rows;
+            const uint8_t* src = p.w[m] + (ok ? wr : 0) * half + kt * 32 + pc * 16;
+            cp_async16(bc + r * 32 + (pc ^ ((r >> 2) & 1)) * 16, src, ok ? 16 : 0);
+        }
+        if (tid < kAdaBT) {   // a token's four groups: scale tile (t / 256) * (K / 256) + kt / 4, row t % 256
+            const int t = token_begin + tid;
+            const bool ok = t < p.tokens;
+            const int64_t tt = ok ? t : 0;
+            const uint8_t* src = p.a_scales + ((tt / kBT) * (K / 256) + kt / 4) * kScaleTileBytes + (tt % kBT) * 16 + (kt % 4) * 4;
+            cp_async4(asc + tid * 4, src, ok ? 4 : 0);
+        }
+        {   // a row's four groups: nvfp4p::scale_index(row, 4 kt .. 4 kt + 3, K)
+            const int r = tid;
+            const int m = SWIGLU ? r / loaded : 0;
+            const int64_t wr = row_begin + (SWIGLU ? r % loaded : r);
+            const bool ok = wr < p.rows;
+            const int64_t rr = ok ? wr : 0;
+            const uint8_t* src = p.w[m] + scale_off + ((rr / 128) * (K / 64) + kt) * 512 + (rr & 31) * 16 + ((rr & 127) >> 5) * 4;
+            cp_async4(bsc + r * 4, src, ok ? 4 : 0);
+        }
+    };
+    float acc[4][8][4] = {};
+    // the warp's group scales of the stage in fp32: tokens as [group][g][mt][h] (token 16 mt + 8 h + g of its 64), rows
+    // as [group][c][f][e] (row 2c + e of fragment f), so a step's scales of a thread are 8 and 16 consecutive floats
+    float* const tsc = reinterpret_cast<float*>(smem + kAdaStages * kAdaStage) + warp * kAdaWarpScales;
+    float* const rsc = tsc + kAdaWarpScales / 2;
+    const int half_swap = (g >> 2) & 1;   // the thread's rows (g mod 8) have their 16-byte halves swapped
+#pragma unroll
+    for (int st = 0; st < kAdaStages - 1; ++st) {
+        if (st < ktiles) load(st, st);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    }
+#pragma unroll 1
+    for (int kt = 0; kt < ktiles; ++kt) {
+        asm volatile("cp.async.wait_group %0;" ::"n"(kAdaStages - 2) : "memory");
+        __syncthreads();   // stage kt is in, and every warp has left stage kt - 1, which the next load refills
+        if (kt + kAdaStages - 1 < ktiles) load(kt + kAdaStages - 1, (kt + kAdaStages - 1) % kAdaStages);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+        const unsigned char* ac = smem + (kt % kAdaStages) * kAdaStage;
+        const unsigned char* bc = ac + kAdaACodes;
+        const unsigned char* asc = bc + kAdaBCodes;
+        const unsigned char* bsc = asc + kAdaAScales;
+        {   // lane l converts the four group scales of the warp's tokens 2l, 2l + 1 and of its rows 2l, 2l + 1
+            const int r = 2 * lane;
+            const uint2 tb = *reinterpret_cast<const uint2*>(asc + (wtk * 64 + r) * 4);
+            const uint2 rb = *reinterpret_cast<const uint2*>(bsc + (ada_row<SWIGLU>(wrw, r >> 3) + (r & 7)) * 4);
+            const int tg = r & 7, tmt = r >> 4, th = (r >> 3) & 1, rf = r >> 3, rc = (r & 7) >> 1;
+            __syncwarp();   // every lane is done with the last stage's scales
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const unsigned sel = (unsigned) q | (unsigned) (4 + q) << 4;   // byte q of each of the two rows
+                const float2 t = ue4m3x2_float2(prmt(tb.x, tb.y, sel));
+                tsc[((q * 8 + tg) * 4 + tmt) * 2 + th] = t.x;
+                tsc[((q * 8 + tg + 1) * 4 + tmt) * 2 + th] = t.y;
+                *reinterpret_cast<float2*>(rsc + ((q * 4 + rc) * 8 + rf) * 2) = ue4m3x2_float2(prmt(rb.x, rb.y, sel));
+            }
+            __syncwarp();
+        }
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {   // group s: the thread's codes 4c .. 4c + 3 of it, from each of its rows
+            const int off = (((s >> 1) ^ half_swap) << 4) + ((s & 1) << 3) + 2 * c;
+            const auto codes = [&](const unsigned char* tile, int row) {
+                return e2m1x4_e4m3(*reinterpret_cast<const unsigned short*>(tile + row * 32 + off));
+            };
+            unsigned a[4][2], b[8];
+#pragma unroll
+            for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) a[mt][h] = codes(ac, wtk * 64 + mt * 16 + g + 8 * h);
+#pragma unroll
+            for (int f = 0; f < 8; ++f) b[f] = codes(bc, ada_row<SWIGLU>(wrw, f) + g);
+            float ts[8], rs[16];   // the step's scales of tokens (mt, h) and of rows (f, e)
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+                *reinterpret_cast<float4*>(ts + 4 * i) = *reinterpret_cast<const float4*>(tsc + (s * 8 + g) * 8 + 4 * i);
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                *reinterpret_cast<float4*>(rs + 4 * i) = *reinterpret_cast<const float4*>(rsc + (s * 4 + c) * 16 + 4 * i);
+#pragma unroll
+            for (int f = 0; f < 8; ++f)
+#pragma unroll
+                for (int mt = 0; mt < 4; ++mt) {
+                    float d[4];
+                    mma_e4m3(d, a[mt][0], a[mt][1], b[f]);
+                    acc[mt][f][0] = fmaf(d[0], ts[2 * mt] * rs[2 * f], acc[mt][f][0]);
+                    acc[mt][f][1] = fmaf(d[1], ts[2 * mt] * rs[2 * f + 1], acc[mt][f][1]);
+                    acc[mt][f][2] = fmaf(d[2], ts[2 * mt + 1] * rs[2 * f], acc[mt][f][2]);
+                    acc[mt][f][3] = fmaf(d[3], ts[2 * mt + 1] * rs[2 * f + 1], acc[mt][f][3]);
+                }
+        }
+    }
+    // kernel's epilogue arithmetic: thread (g, c) holds tokens g and g + 8 of each 16-token fragment, rows 2c and 2c + 1
+    // of each 8-row fragment; the scale a rounded multiply, the add after it a separate rounded add
+    const float s0 = *p.ws[0];
+    const float s1 = SWIGLU ? *p.ws[1] : 0.0f;
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int t = token_begin + wtk * 64 + mt * 16 + g + 8 * h;
+            const bool live = t < p.tokens;
+            const float gt = live ? p.gs[t] : 0.0f;
+            if constexpr (SWIGLU) {
+                const float ag = __fmul_rn(gt, s0), au = __fmul_rn(gt, s1);
+                float m = 0.0f;
+#pragma unroll
+                for (int f = 0; f < 4; ++f) {
+                    float v[2];
+#pragma unroll
+                    for (int e = 0; e < 2; ++e) {
+                        const float gg = __fmul_rn(acc[mt][f][2 * h + e], ag);
+                        const float uu = __fmul_rn(acc[mt][f + 4][2 * h + e], au);
+                        v[e] = __fmul_rn(kernels::silu_quotient(gg), uu);
+                    }
+                    const __nv_bfloat162 hv = __floats2bfloat162_rn(v[0], v[1]);   // the amax is of the stored values
+                    m = fmaxf(m, fmaxf(fabsf(__low2float(hv)), fabsf(__high2float(hv))));
+                    if (live) *reinterpret_cast<__nv_bfloat162*>(p.hdst + (int64_t) t * p.ld + row_begin + 32 * wrw + 8 * f + 2 * c) = hv;
+                }
+                if (p.amax) {   // the token's largest |value|: its four lanes, then one atomic (max is exact)
+                    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+                    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+                    if (c == 0 && live) atomicMax(reinterpret_cast<int*>(p.amax + t), __float_as_int(m));
+                }
+            } else {
+                if (!live) continue;
+                const float alpha = __fmul_rn(gt, s0);
+                float2 res[8];   // ADD: every residual pair loaded before any is written back
+#pragma unroll
+                for (int f = 0; f < 8; ++f) {
+                    const int64_t r = row_begin + 64 * wrw + 8 * f + 2 * c;
+                    res[f] = make_float2(0.0f, 0.0f);
+                    if (ADD && r < p.rows) {
+                        if constexpr (BF)
+                            res[f] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(
+                                reinterpret_cast<const __nv_bfloat16*>(p.dst) + (int64_t) t * p.ld + r));
+                        else
+                            res[f] = __ldcg(reinterpret_cast<const float2*>(p.dst + (int64_t) t * p.ld + r));
+                    }
+                }
+#pragma unroll
+                for (int f = 0; f < 8; ++f) {
+                    const int64_t r = row_begin + 64 * wrw + 8 * f + 2 * c;
+                    if (r >= p.rows) continue;
+                    float2 v = make_float2(__fmul_rn(acc[mt][f][2 * h], alpha), __fmul_rn(acc[mt][f][2 * h + 1], alpha));
+                    if constexpr (ADD) v = make_float2(__fadd_rn(res[f].x, v.x), __fadd_rn(res[f].y, v.y));
+                    if constexpr (BF)
+                        *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(p.dst) + (int64_t) t * p.ld + r) =
+                            __floats2bfloat162_rn(v.x, v.y);
+                    else
+                        *reinterpret_cast<float2*>(p.dst + (int64_t) t * p.ld + r) = v;
+                }
+            }
+        }
+#endif
+}
+
+// E2M1 to nearest, ties to the even code, saturating: the rounding of cvt.rn.satfinite.e2m1x2.f32, which 8.9 lacks
+// (nvfp4_planes.cu rounds the same way)
+__device__ __forceinline__ unsigned e2m1_rn(float x) {
+    const float a = fabsf(x);
+    const unsigned c = a <= 0.25f ? 0 : a < 0.75f ? 1 : a <= 1.25f ? 2 : a < 1.75f ? 3 : a <= 2.5f ? 4 : a < 3.5f ? 5 : a <= 5.0f ? 6 : 7;
+    return c | (x < 0.0f && c ? 8u : 0u);
 }
 
 // One warp per token row (and per padding row of the last scale tile).  Token scale g = amax / (6 * 448); per 16 values
@@ -567,8 +851,12 @@ __global__ void quantize_kernel(const In* __restrict__ x, uint8_t* __restrict__ 
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             unsigned short c;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
+            c = (unsigned short) (e2m1_rn(v[2 * j] * inv) | (e2m1_rn(v[2 * j + 1] * inv) << 4));
+#else
             asm("{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %2, %1; cvt.u16.u8 %0, t; }"
                 : "=h"(c) : "f"(v[2 * j] * inv), "f"(v[2 * j + 1] * inv));   // the first source is the high nibble
+#endif
             w[j >> 2] |= (uint32_t) (c & 0xff) << (8 * (j & 3));
         }
         *reinterpret_cast<uint2*>(codes + r * (cols / 2) + 8 * b) = make_uint2(w[0], w[1]);
@@ -619,8 +907,63 @@ TmaDesc map_2d(const void* base, uint64_t cols, uint64_t rows, uint64_t stride, 
 
 int64_t padded(int64_t tokens) { return (tokens + kBT - 1) / kBT * kBT; }
 
+// the current device has TMA and the FP4 tensor cores (compute capability 9.0 and up: the build's 12.0), per device
+bool tma_device() {
+    static std::atomic<signed char> known[64];   // per device: 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return true; }
+    signed char k = known[dev].load(std::memory_order_acquire);
+    if (k == 0) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return true;
+        }
+        k = major >= 9 ? 2 : 1;
+        known[dev].store(k, std::memory_order_release);
+    }
+    return k == 2;
+}
+
+template <bool SWIGLU, bool ADD, bool BF>
+void launch_ada(const Params& q, const void* w0, const void* w1, int64_t rows, int64_t K, const void* act, int64_t tokens,
+                cudaStream_t s) {
+    constexpr int loaded = SWIGLU ? kAdaBR / 2 : kAdaBR;
+    static std::atomic<bool> configured[64];   // the shared-memory opt-in is per device and per kernel
+    int dev = 0;
+    ck(cudaGetDevice(&dev), "device");
+    if (dev < 0 || dev >= 64) ck(cudaErrorInvalidDevice, "device range");
+    if (!configured[dev].load(std::memory_order_acquire)) {
+        ck(cudaFuncSetAttribute(kernel_ada<SWIGLU, ADD, BF>, cudaFuncAttributeMaxDynamicSharedMemorySize, kAdaSmem), "smem");
+        configured[dev].store(true, std::memory_order_release);
+    }
+    AdaParams p{};
+    p.a_codes = (const uint8_t*) act;
+    p.a_scales = (const uint8_t*) act + tokens * (K / 2);
+    p.w[0] = (const uint8_t*) w0;
+    p.w[1] = (const uint8_t*) (SWIGLU ? w1 : w0);
+    p.gs = q.gs;
+    p.ws[0] = q.ws[0];
+    p.ws[1] = q.ws[1];
+    p.dst = q.dst;
+    p.hdst = q.hdst;
+    p.amax = q.amax;
+    p.ld = q.ld;
+    p.rows = rows;
+    p.K = K;
+    p.tokens = (int) tokens;
+    p.tok_tiles = (int) ((tokens + kAdaBT - 1) / kAdaBT);
+    const int64_t row_tiles = (rows + loaded - 1) / loaded;
+    kernel_ada<SWIGLU, ADD, BF><<<(unsigned) (row_tiles * p.tok_tiles), kAdaThreads, kAdaSmem, s>>>(p);
+    ck(cudaGetLastError(), "product (8.9)");
+}
+
 template <bool SWIGLU, bool ADD, bool BF = false> void launch(Params p, const void* w0, const void* w1, int64_t rows, int64_t K,
                                              const void* act, int64_t tokens, cudaStream_t s) {
+    if (!tma_device()) {
+        launch_ada<SWIGLU, ADD, BF>(p, w0, w1, rows, K, act, tokens, s);
+        return;
+    }
     constexpr int loaded_rows = kBR / (SWIGLU ? 2 : 1);
     static std::atomic<bool> configured[64];   // the shared-memory opt-in is per device and per kernel
     int dev = 0;

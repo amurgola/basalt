@@ -67,7 +67,6 @@ struct Prefill::Run::Chunk::Experts {
     decltype(Chunk::lay0)& lay0 = chunk.lay0;
     decltype(Chunk::stream_all)& stream_all = chunk.stream_all;
     decltype(Chunk::ppc)& ppc = chunk.ppc;
-    decltype(Chunk::peer_fp4)& peer_fp4 = chunk.peer_fp4;
     decltype(Chunk::seq)& seq = chunk.seq;
     decltype(Chunk::seq_start)& seq_start = chunk.seq_start;
     decltype(Chunk::consumed)& consumed = chunk.consumed;
@@ -98,7 +97,7 @@ struct Prefill::Run::Chunk::Experts {
     const int mmq_ut = lay.native ? lay.fmt[(size_t) l].up_type : 42;   // the up rows' type
     // NVFP4 experts: FP4 block-scaled tensor cores, read in place from the blobs
     const bool fp4_l = use_mmq && lay.native && mmq_gt == GGML_TYPE_NVFP4 && mmq_dt == GGML_TYPE_NVFP4 &&
-                       lay.fmt[(size_t) l].tail != 0 && T >= FP4_MIN_TOKENS;
+                       lay.fmt[(size_t) l].tail != 0 && T >= FP4_MIN_TOKENS && fp4_tensor_cores();
     const bool fused_nat = use_mmq && stream_all && lay.native && fused::native_supported(mmq_gt, mmq_dt, mmq_ut);
     const bool fused_l = (use_mmq && stream_all && !lay.native && fused::enabled()) || fused_nat;
     bool peer_now = false;                // multi-GPU: the peer computed rows of this layer (MMQ path only)
@@ -169,7 +168,6 @@ struct Prefill::Run::Chunk::Experts::Group {
     decltype(Experts::lay0)& lay0 = experts.lay0;
     decltype(Experts::stream_all)& stream_all = experts.stream_all;
     decltype(Experts::ppc)& ppc = experts.ppc;
-    decltype(Experts::peer_fp4)& peer_fp4 = experts.peer_fp4;
     decltype(Experts::seq)& seq = experts.seq;
     decltype(Experts::seq_start)& seq_start = experts.seq_start;
     decltype(Experts::consumed)& consumed = experts.consumed;

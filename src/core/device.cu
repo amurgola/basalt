@@ -1,10 +1,12 @@
 // src/core/device.cu - the CUDA side of the runtime core.
 #include "basalt/core/device.hpp"
+#include "basalt/build_archs.hpp"
 #include "basalt/platform/dynlib.hpp"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 
@@ -28,6 +30,32 @@ __global__ void poison_kernel(float* p, uint64_t n_floats) {
 
 
 }  // namespace
+
+namespace {
+std::atomic<int> g_plan_device{-1};   // plan_sms_device
+std::atomic<int> g_plan_sms[64];      // per ordinal, 0 until read
+}  // namespace
+
+void plan_sms_device(int ordinal) { g_plan_device.store(ordinal, std::memory_order_relaxed); }
+
+int plan_sms(int ordinal) {
+    int dev = g_plan_device.load(std::memory_order_relaxed);
+    if (dev < 0) dev = ordinal;
+    if (dev < 0 && cudaGetDevice(&dev) != cudaSuccess) {
+        cudaGetLastError();
+        dev = 0;
+    }
+    if (dev < 0 || dev >= 64) dev = 0;
+    int v = g_plan_sms[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        if (cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || v <= 0) {
+            cudaGetLastError();
+            v = 1;
+        }
+        g_plan_sms[dev].store(v, std::memory_order_relaxed);
+    }
+    return v;
+}
 
 int device_count() {
     int count = 0;
@@ -207,7 +235,7 @@ DeviceInfo device_info(int ordinal) {
     int count = 0;
     check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
     if (count == 0) {
-        throw CudaError("no CUDA device is present; basalt needs an NVIDIA GPU of compute capability 12.0", -1);
+        throw CudaError("no CUDA device is present; basalt needs an NVIDIA GPU of compute capability 12.0 or 8.9", -1);
     }
     if (ordinal < 0 || ordinal >= count) {
         throw CudaError("device ordinal " + std::to_string(ordinal) + " is out of range (have " +
@@ -233,11 +261,20 @@ DeviceInfo device_info(int ordinal) {
     check(cudaDriverGetVersion(&d.driver_version), "cudaDriverGetVersion");
     check(cudaRuntimeGetVersion(&d.runtime_version), "cudaRuntimeGetVersion");
 
-    // The binary holds code for one compute capability only; a card of another compute capability is refused here rather than failing
-    // at its first kernel launch.
-    if (d.cc_major != 12 || d.cc_minor != 0) {
+    // The binary holds code for compute capability 12.0 and 8.9 only; a card of another compute capability is refused
+    // here rather than failing at its first kernel launch.
+    const bool cc_ok = (d.cc_major == 12 && d.cc_minor == 0) || (d.cc_major == 8 && d.cc_minor == 9);
+    if (!cc_ok) {
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) + "." +
-                            std::to_string(d.cc_minor) + "; basalt needs an NVIDIA GPU of compute capability 12.0",
+                            std::to_string(d.cc_minor) + "; basalt needs an NVIDIA GPU of compute capability 12.0 or 8.9",
+                        -1);
+    }
+    // and only for the architectures it was built for (build_archs.hpp): another one would run lower PTX with the
+    // code its paths need compiled out
+    if (!basalt::build_has_arch(d.cc_major, d.cc_minor)) {
+        throw CudaError("device " + d.name + " is sm_" + std::to_string(d.cc_major) + std::to_string(d.cc_minor) +
+                            " and this build has device code for " + basalt::build_archs() +
+                            " only; build with -DCMAKE_CUDA_ARCHITECTURES=\"120;89\" for Blackwell and Ada cards together",
                         -1);
     }
     return d;

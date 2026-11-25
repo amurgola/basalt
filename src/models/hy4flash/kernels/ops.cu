@@ -96,7 +96,11 @@ __device__ void l2_read_ahead_block(const L2Ranges& r, uint32_t* mark, uint32_t 
             }
             const uint64_t take = min(min(o1 - o, r.n[i] - ro), (uint64_t) 32768);
             const char* src = (const char*) r.p[i] + ro;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900   // no bulk prefetch below 9.0: a line at a time
+            for (uint64_t q = 0; q < take; q += 128) asm volatile("prefetch.global.L2 [%0];" ::"l"(src + q));
+#else
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src), "r"((unsigned) take) : "memory");
+#endif
             last = src + take - 16;
             o += take;
         }
@@ -172,7 +176,7 @@ __global__ void engram_kernel(const float* __restrict__ kv, const float* __restr
     ssx = block_sum<kEngramThreads>(ssx, red);
     ssk = block_sum<kEngramThreads>(ssk, red);
     ssv = block_sum<kEngramThreads>(ssv, red);
-    const float rx = rsqrtf(ssx / (float) n + a.gate_eps), rk = rsqrtf(ssk / (float) n + a.gate_eps), rv = rsqrtf(ssv / (float) n + a.eps);
+    const float rx = rsqrtf(ssx / (float) n + a.eps), rk = rsqrtf(ssk / (float) n + a.eps), rv = rsqrtf(ssv / (float) n + a.eps);
     float dot = 0.f;
     for (int j = threadIdx.x; j < n; j += kEngramThreads)
         dot = fmaf((xi[j] * rx) * ((key[j] + kb[j]) * rk), gate_w[(size_t) i * n + j], dot);

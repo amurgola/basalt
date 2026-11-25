@@ -2,6 +2,7 @@
 #include "record.hpp"
 #include "expert_plan.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
+#include "basalt/core/diag.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/core/peer_experts.hpp"
@@ -122,7 +123,8 @@ bool Verifier::WindowRecorder::post(int64_t l) {
             native_expert_grouped(L, P->ptr, P->start, P->counts, P->dst, P->tok, cap, cap,
                                   v_.nat_xq_, v_.hit_scratch_, parts_out, cs);
         }
-        if (v_.dm_->stage_src != nullptr && v_.batch_rec_) {   // the staged share, once its copy is in staging
+        // the staged share, once its copy is in staging
+        if (v_.dm_->stage_src != nullptr && (v_.batch_rec_ || v_.solo_stage_)) {
             cudaStreamWaitEvent(cs, v_.dm_->st_join, 0);
             PdlScope pst(false);
             native_expert_grouped(L, P->sptr, P->sstart, P->scounts, P->sdst, P->stok, cap, cap, v_.nat_xq_,
@@ -176,6 +178,7 @@ bool Verifier::WindowRecorder::post(int64_t l) {
         cudaStreamWaitEvent(cs, v_.ev_join_, 0);
         if (ring_fork) cudaStreamWaitEvent(cs, v_.ev_ring_join_, 0);   // the ring's launch
     }
+    if (dm) l2_ahead(l);
     if (dm) {
         // the combine polls the peers' rows themselves (with further peers always: the wait counts one done word);
         // one peer's done word also ends the poll, but with further peers only a release does (word 60).  Without
@@ -212,6 +215,51 @@ bool Verifier::WindowRecorder::post(int64_t l) {
         cvec_apply(Rt(0), l, n, HC * N, v_.bo_, N, v_.inj2_, HC, true, cs);
     }
     return true;
+}
+
+// Without the lazy commit (l2a_s_): post's read-ahead of the next layer's projections and FFN read matrices, forked once
+// the layer's MoE grid is launched, so it runs beside the combine and never beside a grid that needs its SMs.
+// --exp l2_ahead=0 leaves it out.
+void Verifier::WindowRecorder::l2_ahead(int64_t l) {
+    using namespace basalt::kernels;
+    if (v_.l2a_s_ == nullptr || exp_flag("l2_ahead", 1.0) == 0.0 || !v_.dm_->tags || v_.batch_rec_ || cs != v_.cs_ ||
+        l + 1 >= v_.le_)
+        return;
+    GdnLazyPf pf;
+    int r = 0;
+    auto add = [&](const void* p, uint64_t b) {
+        if (p == nullptr || (b & ~15ull) == 0 || r == kLazyPfRanges) return;
+        pf.p[r] = p; pf.n[r++] = b & ~15ull;
+    };
+    const LayerView nv(wt, l + 1);
+    const bool qsa = is_qsa_layer(g, l + 1);
+    const char* names_gdn[] = {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight"};
+    const char* names_qsa[] = {"attn_q.weight", "attn_k.weight", "attn_v.weight", "indexer.q_proj.weight",
+                               "indexer.k_proj.weight", "attn_output.weight"};
+    for (int i = 0; i < (qsa ? 6 : 3); ++i) {
+        const WeightRef* w = nv.get(qsa ? names_qsa[i] : names_gdn[i]);
+        if (w == nullptr) continue;
+        if (w->native_data != nullptr)
+            add(w->native_data, (uint64_t) iq_row_bytes(w->native_type, w->ne0) * (uint64_t) w->ne1);
+        else
+            add(w->data, w->bytes);
+    }
+    // the FFN read's 8-bit copies (codes and scales are one range), the router and the shared expert's gate row
+    for (const char* nm : {"hc_ffn_down.weight", "hc_ffn_inject.weight", "hc_ffn_up.weight"}) {
+        const WeightRef* w = nv.get(nm);
+        Hc8View hv;
+        if (w != nullptr && hc8_view(w->data, hv)) add(hv.q, hv.bytes);
+    }
+    for (const char* nm : {"ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight"}) {
+        const WeightRef* w = nv.get(nm);
+        if (w != nullptr) add(w->data, w->bytes);
+    }
+    pf.ids = v_.ids_; pf.n_ids = T * (int) K; pf.n_expert = (int) g.n_expert; pf.ptab = v_.dm_->ptab0 + l * g.n_expert;
+    cudaEventRecord(v_.l2a_fork_, cs);
+    cudaStreamWaitEvent(v_.l2a_s_, v_.l2a_fork_, 0);
+    gdn_l2_ahead(v_.dm_->cseen, (uint32_t) (l - v_.lb_ + 1), v_.l2a_s_, pf);
+    cudaEventRecord(v_.l2a_join_, v_.l2a_s_);
+    l2a_open = true;
 }
 
 }  // namespace basalt::core

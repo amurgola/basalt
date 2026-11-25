@@ -1067,6 +1067,7 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
     X(16, 20) X(17, 20) X(18, 20) X(21, 20) X(22, 20) X(23, 20) X(29, 20) X(42, 20) \
     X(16, 42) X(17, 42) X(18, 42) X(21, 42) X(22, 42) X(23, 42) X(29, 42) X(42, 42) \
     X(16, 6) X(17, 6) X(18, 6) X(21, 6) X(22, 6) X(23, 6) X(29, 6) X(42, 6) \
+    X(22, 7) X(18, 7) X(21, 7) \
     X(40, 40) X(12, 7) X(12, 8) X(13, 8) X(14, 8) X(8, 8) X(21, 8) X(23, 8)   // IQ3_S / IQ4_XS gate/up, Q8_0 down
 // the mixed gate/up layers (GU_MIX) as (gate, up, down)
 #define DM_MIX(X) X(22, 16, 42)
@@ -1412,17 +1413,24 @@ struct DmTmaShared {
     unsigned long long gptr[kDmCap];
 };
 
+// The bulk copies, transaction barriers and async-proxy fence of the TMA kernel need compute capability 9.0.  Below it
+// they trap: dec_moe_vram's TMA kind is never selected there.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+#define DM_SM90_ONLY(...) __trap()
+#else
+#define DM_SM90_ONLY(...) __VA_ARGS__
+#endif
 __device__ __forceinline__ uint32_t dm_smem(const void* p) { return (uint32_t) __cvta_generic_to_shared(p); }
 __device__ __forceinline__ void dm_bulk(void* dst, const void* src, uint32_t bytes, unsigned long long* bar) {
-    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(dm_smem(bar)), "r"(bytes) : "memory");
-    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-                 :: "r"(dm_smem(dst)), "l"(src), "r"(bytes), "r"(dm_smem(bar)) : "memory");
+    DM_SM90_ONLY(asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(dm_smem(bar)), "r"(bytes) : "memory"));
+    DM_SM90_ONLY(asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                              :: "r"(dm_smem(dst)), "l"(src), "r"(bytes), "r"(dm_smem(bar)) : "memory"));
 }
 __device__ __forceinline__ void dm_bar_wait(unsigned long long* bar, uint32_t parity) {
     uint32_t ok = 0;
     while (!ok)
-        asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
-                     : "=r"(ok) : "r"(dm_smem(bar)), "r"(parity) : "memory");
+        DM_SM90_ONLY(asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
+                                  : "=r"(ok) : "r"(dm_smem(bar)), "r"(parity) : "memory"));
 }
 
 // sm's groups (ng, start, gptr, tok, dst set) through the bulk-copy pipeline: block b of nb takes items b, b + nb, ...
@@ -1460,7 +1468,7 @@ __device__ int dm_experts_tma(DmTmaShared& sm, int ng, const block_q8_1* __restr
         if (k > 0) __syncthreads();              // stage (k - 1) is consumed: refill it
         if (tid == 0) {
             // the warps read the stage with generic loads; the refill is an async-proxy write
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            DM_SM90_ONLY(asm volatile("fence.proxy.async.shared::cta;" ::: "memory"));
             issue(k + kTmaStages - 1);
         }
         const int st = (base + k) % kTmaStages;
@@ -1509,8 +1517,8 @@ __device__ int dm_experts_tma(DmTmaShared& sm, int ng, const block_q8_1* __restr
 __device__ __forceinline__ void dm_bars_init(DmTmaShared& sm) {
     if (threadIdx.x == 0) {
         for (int i = 0; i < kTmaStages; ++i)
-            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(dm_smem(&sm.bar[i])) : "memory");
-        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+            DM_SM90_ONLY(asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(dm_smem(&sm.bar[i])) : "memory"));
+        DM_SM90_ONLY(asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory"));
     }
 }
 
@@ -1663,8 +1671,9 @@ int dm_vram_tma_blocks() {
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 0; }
     if (known[dev] == 0) {
-        int sms = 0, per = 0;
-        if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
+        int sms = 0, per = 0, major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess || major < 9 ||
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, dm_vram_tma_kernel<TG, TD>, kDmThreads, 0) != cudaSuccess) {
             cudaGetLastError();
             per = 0;

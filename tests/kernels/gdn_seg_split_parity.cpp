@@ -1,8 +1,9 @@
 // tests/kernels/gdn_seg_split_parity.cpp - dec_gdn_gates, then dec_gdn_rec_seg_split (split kernel per segment, then
 // the norm), against dec_gdn_rec_seg (a cluster per head) bitwise: h, gates, betas, the raw qkv channels, y, y16 and the q8_1 rows, over
 // segment mixes up to the batch window's 16 rows, with and without SegDst, both widths and both output gates, and the
-// norm in place (a.o == a.y).  dec_gdn_rec_seg is itself bitwise to dec_gdn_rec per segment (dec_gdn_parity).
-// Exit 77 without a GPU.
+// norm in place (a.o == a.y).  dec_gdn_rec_seg is itself bitwise to dec_gdn_rec per segment (dec_gdn_parity), which is
+// the reference on a card without thread-block clusters (below compute capability 9.0, where dec_gdn_rec runs its split
+// kernel with the gates computed inside, and dec_gdn_rec_seg is refused).  Exit 77 without a GPU.
 #include "basalt/kernels/gdn_window.hpp"
 
 #include <cuda_runtime.h>
@@ -20,6 +21,7 @@ std::mt19937 rng(7);
 std::normal_distribution<float> nd(0.f, 1.f);
 cudaStream_t S0;
 int fails = 0;
+bool g_clusters = true;   // device 0 has thread-block clusters (compute capability 9.0+)
 
 template <class T> T* up(const std::vector<T>& h) {
     T* d = nullptr;
@@ -119,8 +121,25 @@ void run(const Geo& g, const std::vector<int>& seg, bool use_dst, GdnGate gate, 
     for (int p = 0; p < 2; ++p) {
         DecRecArgs b = a;
         b.h = o[p].h; b.gate = o[p].gate; b.beta = o[p].beta; b.y = o[p].y; b.y16 = o[p].y16; b.yq = o[p].yq;
-        if (p == 0) dec_gdn_rec_seg(b, d_rows, 0, (int) seg.size(), max_n, S0, dd[0]);
-        else {
+        if (p == 0 && g_clusters) {
+            dec_gdn_rec_seg(b, d_rows, 0, (int) seg.size(), max_n, S0, dd[0]);
+        } else if (p == 0) {   // each segment's dec_gdn_rec at its rows (dec_gdn_rec_seg's seg_args)
+            for (size_t k = 0; k < seg.size(); ++k) {
+                const size_t r0 = (size_t) first[k].row0;
+                DecRecArgs ak = b;
+                ak.state = states[k];
+                ak.qkv += r0 * C; ak.x += r0 * E; ak.z += r0 * VD;
+                if (!use_dst) {
+                    ak.h += r0 * C; ak.gate += r0 * g.h_v; ak.beta += r0 * g.h_v;
+                } else {
+                    ak.h = dh[0][k].h; ak.gate = dh[0][k].gate; ak.beta = dh[0][k].beta; ak.qkv_out = dh[0][k].qkv;
+                }
+                ak.y += r0 * VD; ak.y16 += r0 * VD;
+                ak.yq = static_cast<char*>(ak.yq) + r0 * (VD / 32) * 36;
+                ak.o = in_place ? ak.y : o[0].o + r0 * VD;
+                dec_gdn_rec(ak, seg[k], S0);
+            }
+        } else {
             b.o = o[p].o;
             dec_gdn_gates(b, rows, gates, S0);
             dec_gdn_rec_seg_split(b, d_rows, 0, (int) seg.size(), max_n, rows, S0, dd[1], 0, 0, gates);
@@ -157,6 +176,10 @@ void run(const Geo& g, const std::vector<int>& seg, bool use_dst, GdnGate gate, 
 int main() {
     int n_dev = 0;
     if (cudaGetDeviceCount(&n_dev) != cudaSuccess || n_dev == 0) return 77;
+    int major = 0;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
+    g_clusters = major >= 9;
+    if (!g_clusters) std::printf("no thread-block clusters (compute capability %d): the reference is dec_gdn_rec per segment\n", major);
     cudaStreamCreate(&S0);
     const Geo big{5120, 16, 48}, small{2560, 16, 32};
     const std::vector<std::vector<int>> mixes = {{1, 1}, {5, 3}, {8, 8}, {2, 14}, {16}, {4, 4, 4}, {9, 7}};

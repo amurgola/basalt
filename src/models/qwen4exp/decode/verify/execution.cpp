@@ -56,18 +56,24 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
 }
 
 // One window through every stage: all of them launch first (a later stage's graph waits on the hand-off flag its
-// predecessor's graph raises), then the host serves each stage's rings in turn.
+// predecessor's graph raises), then the host serves each stage's rings in turn.  Stages that share a card (a split's
+// reference with both on CUDA0, --diag-gpu-same) launch each once the one before has ended: a later stage's wait for
+// the hand-off would hold the card its predecessor's layers need, and the window would never reach its first ring.
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
     const std::function<void()> served = std::move(served_hook_);
     served_hook_ = nullptr;
-    for (Verifier* v = this; v != nullptr; v = v->next_)
+    bool one_card = false;
+    for (Verifier* v = this; v != nullptr; v = v->next_) {
         if (v->lb_ > 0 && v->h_flag_ != nullptr) *(volatile uint32_t*) (v->h_flag_ + 12) = 0;
+        one_card = one_card || (v->next_ != nullptr && v->next_->device_ == device_);
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    for (Verifier* v = this; v != nullptr; v = v->next_)
+    for (Verifier* v = this; v != nullptr && !one_card; v = v->next_)
         if (!v->run_begin(T, tokens, pos0, err)) return false;
     void* u = user;
     for (Verifier* v = this; v != nullptr; v = v->next_) {
+        if (one_card && !v->run_begin(T, tokens, pos0, err)) return false;
         if (!v->run_serve(pool, u, err)) return false;
         if (v->next_ == nullptr && served) served();
         if (!v->run_end(v->next_ == nullptr ? out : nullptr, err)) return false;
@@ -113,6 +119,7 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     if (gs_split_ && !gs_live_ && !gs_move(true, err)) return false;
     if (dm_ != nullptr) {   // this window's residency, then the peer window ahead of CUDA0's
         if (!dm_begin(err, &gm)) return false;
+        if (solo_stage_ && !dm_stage_places(err)) return false;
     }
     ms_host += ms_since(t0);
     if (prof_on_) decode_gaps().verify_end = 0;   // set again only by a collected window

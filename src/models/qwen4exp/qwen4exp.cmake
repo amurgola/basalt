@@ -46,9 +46,12 @@ add_library(model_qwen4exp_kernels STATIC
   src/models/qwen4exp/kernels/verify_kernels.cu
   src/models/qwen4exp/kernels/dense_tc.cu
   src/models/qwen4exp/kernels/mid_chain.cu
+  src/models/qwen4exp/kernels/mid_chain_ada.cu
   src/models/qwen4exp/kernels/qsa_mid.cu
   src/models/qwen4exp/kernels/hc_fused.cu
-  src/models/qwen4exp/kernels/hc8_gr.cu)
+  src/models/qwen4exp/kernels/hc8_gr.cu
+  src/models/qwen4exp/kernels/hc_read_ada.cu
+  src/models/qwen4exp/kernels/hc_fused_ada.cu)
 target_link_libraries(model_qwen4exp_kernels PUBLIC kernels)
 
 # The composed layer: layer and session, the verify windows, the MTP drafter, the conversation state.
@@ -133,4 +136,4 @@ add_library(model_qwen4exp_prefill STATIC src/models/qwen4exp/prefill/gemm.cu sr
   src/models/qwen4exp/prefill/combine.cpp
   src/models/qwen4exp/prefill/handoff.cpp)
 target_include_directories(model_qwen4exp_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_gpu_include_directories})
-target_link_libraries(model_qwen4exp_prefill PUBLIC model_qwen4exp_engine ${_gpu_blas_target} ${_gpu_runtime_target})
+target_link_libraries(model_qwen4exp_prefill PUBLIC model_qwen4exp_engine ${_gpu_blas_target} CUDA::cublasLt ${_gpu_runtime_target})

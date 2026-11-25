@@ -3,9 +3,9 @@
 Linux x64 and Windows x64, NVIDIA Blackwell (sm_120). Linux is where the engine is tested and benchmarked. CI builds both and runs
 the CPU tests on each. The GPU tests and the quality gate need a card.
 
-The main card is always sm_120, with one exception in the multi-GPU tier: when built with `-DPEER_ADA=ON` or `-DPEER_AMPERE=ON`, a second card of sm_89 (Ada) or sm_86 / sm_80 (Ampere)
-can hold and compute the expert tier ([GPUs](configuration/gpus.md#an-older-peer-card)); every other path and every other
-architecture is Blackwell-only.
+This fork also runs every path on sm_89 (Ada), as the only card, the main card or a second card, in a build that holds
+sm_89 code ([GPUs](configuration/gpus.md#an-ada-sm_89-card), [Ada port notes](../ADA_PORT_NOTES.md)); every other
+architecture is refused.
 
 | | Linux | Windows |
 | --- | --- | --- |
@@ -112,4 +112,8 @@ on both, and the pool output matches the serial run bit for bit.
 
 Greedy tokens differ across the builds: with tiers pinned and adaptive swaps off, `struct` matches over 300 tokens, `conv` diverges at
 token 23 and `prose` at token 44. One build matches itself run to run, so the difference is the host compiler's CPU code (78% of expert
-rows). Quality of the Windows build has not been run ([quality](precision/quality.md)).
+rows). The Windows build's quality ([quality](precision/quality.md)): `basalt-bench --quality 100 -- --kv int8` against a base built
+under MSVC (same llama.cpp commit and BF16 GGUF; PPL 3.2771, 3.2759 on the scored rows, against the reference's 3.2749 and
+3.2733), `Qwen3.8-FN-NVFP4` (122.6 GiB), RTX 4090 at 450 W: PPL 3.3119, KLD 0.0619, same top-1 91.79%. The card's
+NVFP4-DQ6_K (122.0 GiB), RTX 5090 at 400 W + RTX 5060 Ti at 180 W: 3.304, 0.0624, 91.65%. GPU, base and pack file differ
+as well as the compiler, so this does not isolate the compiler.

@@ -63,6 +63,10 @@ void gdn_commit_lazy(const GdnCommitLayers& a, CommitCtl* ctl, int must_layers, 
                      uint32_t stop_value, void* stream, int blocks, const GdnLazyPf* pf = nullptr);
 /// The lazy counter of a new CommitCtl: nothing owed until the first begin kernel.
 bool gdn_commit_lazy_none(CommitCtl* ctl);
+/// gdn_commit_lazy's read-ahead of `pf` alone, for a device that commits no layer lazily: launched beside a combine
+/// once the layer's MoE grid is done, with the same stop word.  It returns when the combine has not marked a wait
+/// shortly after the launch.
+void gdn_l2_ahead(const uint32_t* stop, uint32_t stop_value, void* stream, const GdnLazyPf& pf);
 /// gdn_conv_l2_multi over a segmented window: every row's conv from its own segment's history (hist_off floats past
 /// `gdn`: the layer's conv history), all n_rows rows in one launch; bitwise the per-segment calls.
 void gdn_conv_l2_seg(const SegRow* rows, size_t hist_off, const float* qkv, const float* conv_w, float* h, int channels,

@@ -4,5 +4,6 @@ src/models/qwen4exp/kernels/dec_moe_prelude.cuh ../../../kernels/cuda/iq_kernels
 src/models/qwen4exp/kernels/dec_moe_prelude.cuh ../../../kernels/cuda/gdn_window.cu
 src/models/qwen4exp/kernels/mid_chain.cu hc_fused.cu
 src/models/qwen4exp/kernels/mid_chain.cu dense_tc.cu
+src/models/qwen4exp/kernels/mid_chain_ada.cu dense_tc.cu
 src/models/qwen4exp/kernels/mid_chain.cu ../../../kernels/cuda/gdn_window.cu
 src/models/qwen4exp/kernels/qsa_mid.cu dense_tc.cu

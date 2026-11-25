@@ -31,6 +31,7 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <stdexcept>
@@ -277,13 +278,51 @@ __device__ __forceinline__ float index_key_row(const uint16_t* __restrict__ w, c
     return warp_sum(acc);
 }
 
+// Stage: the key from its projection `y` (kIdxDim values), by the whole block: rms_norm, norm_w, the rotation at the
+// group's first position, the store into row `row` of the index cache. The threads past the key add zeros to the sum.
+__device__ __forceinline__ void index_key_finish(float* y, float* red, int t, int row, const int32_t* __restrict__ pos,
+                                                 int ratio, float eps, const float* __restrict__ norm_w,
+                                                 const float* __restrict__ freq, uint8_t* __restrict__ comp_ik,
+                                                 bool packed) {
+    const float v = threadIdx.x < kIdxDim ? y[threadIdx.x] : 0.f;
+    const float ss = block_sum(v * v, red);   // the threads past the key add zeros
+    const float r = 1.0f / sqrtf(ss / kIdxDim + eps);
+    if (threadIdx.x < kIdxDim) y[threadIdx.x] = v * r * norm_w[threadIdx.x];
+    __syncthreads();
+    if (threadIdx.x < kIdxDim) {
+        const int c = threadIdx.x;
+        float o = y[c];
+        if (c >= kIdxDim - kRopeDim) {
+            const int p = (c - (kIdxDim - kRopeDim)) >> 1;
+            float x0 = y[kIdxDim - kRopeDim + 2 * p], x1 = y[kIdxDim - kRopeDim + 2 * p + 1];
+            rotate_pair(x0, x1, (float) (pos[t] + 1 - ratio), freq[p]);
+            o = (c & 1) ? x1 : x0;
+        }
+        put_idx(o, c, comp_ik, (size_t) row, packed);
+    }
+}
+
+// Thread-block clusters (distributed shared memory, barrier.cluster) exist from compute capability 9.0. Below it (the
+// 8.9 build, or any device pass under 9.0) index_key_kernel has no cluster attribute and traps if it is ever launched;
+// index_keys() runs index_key_block_kernel there instead. BASALT_ARCH_BELOW_SM90 is CMake's: a build with no
+// architecture of 9.0 or up.
+#if defined(BASALT_ARCH_BELOW_SM90) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900)
+#define KEY_NO_CLUSTER 1
+#define KEY_CLUSTER_DIMS
+#else
+#define KEY_CLUSTER_DIMS __cluster_dims__(kKeyBlocks, 1, 1)
+#endif
+
 // Index key of a closed group: rms_norm(w_idx_k . comp) * norm_w, rotated at the group's first position. A cluster
 // of kKeyBlocks blocks per token splits the projection's rows; block 0 gathers them and finishes the key.
-__global__ void __cluster_dims__(kKeyBlocks, 1, 1) __launch_bounds__(32 * kKeyRows)
+__global__ void KEY_CLUSTER_DIMS __launch_bounds__(32 * kKeyRows)
 index_key_kernel(const float* __restrict__ comp_pre, const int32_t* __restrict__ row_of,
                  const int32_t* __restrict__ pos, int ratio, float eps,
                  const uint16_t* __restrict__ w, const float* __restrict__ norm_w,
                  const float* __restrict__ freq, uint8_t* __restrict__ comp_ik, bool packed) {
+#ifdef KEY_NO_CLUSTER
+    __trap();
+#else
     const int t = blockIdx.y;
     const int row = row_of[t];
     if (row < 0) return;   // the whole cluster: it is one token's
@@ -302,22 +341,32 @@ index_key_kernel(const float* __restrict__ comp_pre, const int32_t* __restrict__
     if (rank == 0 && threadIdx.x < kIdxDim) y[threadIdx.x] = cl.map_shared_rank(part, threadIdx.x / kKeyRows)[threadIdx.x % kKeyRows];
     cl.sync();   // the other blocks' rows are read: they may go
     if (rank != 0) return;
-    const float v = threadIdx.x < kIdxDim ? y[threadIdx.x] : 0.f;
-    const float ss = block_sum(v * v, red);   // the threads past the key add zeros
-    const float r = 1.0f / sqrtf(ss / kIdxDim + eps);
-    if (threadIdx.x < kIdxDim) y[threadIdx.x] = v * r * norm_w[threadIdx.x];
+    index_key_finish(y, red, t, row, pos, ratio, eps, norm_w, freq, comp_ik, packed);
+#endif
+}
+
+// index_key_kernel without a cluster, for compute capability under 9.0: a block per token whose warps take the
+// projection's rows in turn (index_key_row), then the same finish. Each row is one warp's sum in the same order, and
+// block_sum's extra warps add zeros, so the key has the cluster form's bits.
+__global__ void __launch_bounds__(256)
+index_key_block_kernel(const float* __restrict__ comp_pre, const int32_t* __restrict__ row_of,
+                       const int32_t* __restrict__ pos, int ratio, float eps,
+                       const uint16_t* __restrict__ w, const float* __restrict__ norm_w,
+                       const float* __restrict__ freq, uint8_t* __restrict__ comp_ik, bool packed) {
+    const int t = blockIdx.x;
+    const int row = row_of[t];
+    if (row < 0) return;
+    __shared__ float x[kLatent];
+    __shared__ float y[kIdxDim];
+    __shared__ float red[32];
+    for (int i = threadIdx.x; i < kLatent; i += blockDim.x) x[i] = comp_pre[(size_t) t * kLatent + i];
     __syncthreads();
-    if (threadIdx.x < kIdxDim) {
-        const int c = threadIdx.x;
-        float o = y[c];
-        if (c >= kIdxDim - kRopeDim) {
-            const int p = (c - (kIdxDim - kRopeDim)) >> 1;
-            float x0 = y[kIdxDim - kRopeDim + 2 * p], x1 = y[kIdxDim - kRopeDim + 2 * p + 1];
-            rotate_pair(x0, x1, (float) (pos[t] + 1 - ratio), freq[p]);
-            o = (c & 1) ? x1 : x0;
-        }
-        put_idx(o, c, comp_ik, (size_t) row, packed);
+    for (int o = threadIdx.x >> 5; o < kIdxDim; o += blockDim.x >> 5) {
+        const float p = index_key_row(w, x, o);
+        if ((threadIdx.x & 31) == 0) y[o] = p;
     }
+    __syncthreads();
+    index_key_finish(y, red, t, row, pos, ratio, eps, norm_w, freq, comp_ik, packed);
 }
 
 // ---- indexer --------------------------------------------------------------------------------------------------
@@ -399,6 +448,89 @@ __global__ void idx_score_kernel(const float* __restrict__ iq, const float* __re
     #pragma unroll
         for (int h = 0; h < kIdxHeads; ++h) s += fmaxf(acc[h], 0.f) * (w[h] * w_scale);
         *out = s;
+    }
+}
+
+// idx_score_kernel<true> without a candidate mask, on the tensor cores: the queries (rounded to FP4 with power-of-two
+// scales) and the FP4 key rows are exact in bf16, so every product is exact and only the order of the sums of the
+// 128 dims differs (an FP32 accumulation; within the dynamic range of the scales the sums are exact). The heads' sum
+// runs in idx_score_kernel's order. A block: kTcTok tokens (their 32 heads each) against key tiles of kTcRows rows,
+// a tile apart by gridDim.x.
+constexpr int kTcTok = 2, kTcRows = 64, kTcLd = kIdxDim + 8, kTcCLd = kTcRows + 4, kTcThreads = 128, kTcScoreBlocks = 64;
+constexpr int kTcM = kTcTok * kIdxHeads;
+constexpr size_t kTcSmem = (size_t) kTcM * kTcLd * 2 + (size_t) kTcRows * kTcLd * 2 + (size_t) kTcM * kTcCLd * 4;
+static_assert(kTcM / 16 == kTcThreads / 32, "a warp per 16 query rows");
+static_assert(kTcTok * kTcRows == kTcThreads, "a thread per (token, row) in the epilogue");
+
+__global__ void __launch_bounds__(kTcThreads) idx_score_tc_kernel(const float* __restrict__ iq, const float* __restrict__ iw,
+                                                                   const int32_t* __restrict__ pos, int n_tokens,
+                                                                   const uint8_t* __restrict__ ik, int n_comp, int ratio,
+                                                                   float w_scale, float* __restrict__ scores) {
+    using namespace nvcuda;
+    extern __shared__ __align__(128) unsigned char tc_smem[];
+    __nv_bfloat16* As = reinterpret_cast<__nv_bfloat16*>(tc_smem);
+    __nv_bfloat16* Bs = As + (size_t) kTcM * kTcLd;
+    float* Cs = reinterpret_cast<float*>(Bs + (size_t) kTcRows * kTcLd);
+    __shared__ float wsh[kTcTok][kIdxHeads];
+    const int t0 = blockIdx.y * kTcTok, nt = min(kTcTok, n_tokens - t0);
+    const int n_eff = eff_rows(pos, n_tokens, ratio, n_comp);
+    if (blockIdx.x * kTcRows >= n_eff) return;
+    for (int i = threadIdx.x; i < kTcM * kIdxDim; i += kTcThreads) {
+        const int r = i / kIdxDim, d = i % kIdxDim, t = r / kIdxHeads;
+        As[r * kTcLd + d] = __float2bfloat16(t < nt ? iq[(size_t) (t0 + t) * kIdxHeads * kIdxDim + (size_t) (r % kIdxHeads) * kIdxDim + d] : 0.f);
+    }
+    if (threadIdx.x < kTcTok * kIdxHeads) {
+        const int t = threadIdx.x / kIdxHeads, h = threadIdx.x % kIdxHeads;
+        wsh[t][h] = t < nt ? iw[(t0 + t) * kIdxHeads + h] : 0.f;
+    }
+    const int warp = threadIdx.x >> 5;
+    for (int base = blockIdx.x * kTcRows; base < n_eff; base += gridDim.x * kTcRows) {
+        __syncthreads();   // the last tile's epilogue is done with Bs and Cs
+        // decode the tile's key rows: a thread per (row, word of 8 values)
+        for (int i = threadIdx.x; i < kTcRows * (kIdxDim / 8); i += kTcThreads) {
+            const int r = i / (kIdxDim / 8), c = i % (kIdxDim / 8), j = base + r;
+            float k[8];
+            if (j < n_eff) {
+                const uint8_t* row = ik + (size_t) j * kIdxRowBytes;
+                const uint32_t sw = *reinterpret_cast<const uint32_t*>(row + kIdxDim / 2);
+                rows::fp4p_values<8>(reinterpret_cast<const uint32_t*>(row)[c], (sw >> (8 * (c / 4))) & 0xffu, k);
+            } else {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) k[e] = 0.f;
+            }
+#pragma unroll
+            for (int e = 0; e < 8; ++e) Bs[r * kTcLd + c * 8 + e] = __float2bfloat16(k[e]);
+        }
+        __syncthreads();
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[kTcRows / 16];
+#pragma unroll
+        for (int n = 0; n < kTcRows / 16; ++n) wmma::fill_fragment(acc[n], 0.f);
+#pragma unroll
+        for (int kk = 0; kk < kIdxDim / 16; ++kk) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+            wmma::load_matrix_sync(a, As + (size_t) warp * 16 * kTcLd + kk * 16, kTcLd);
+#pragma unroll
+            for (int n = 0; n < kTcRows / 16; ++n) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
+                wmma::load_matrix_sync(b, Bs + (size_t) n * 16 * kTcLd + kk * 16, kTcLd);
+                wmma::mma_sync(acc[n], a, b, acc[n]);
+            }
+        }
+#pragma unroll
+        for (int n = 0; n < kTcRows / 16; ++n)
+            wmma::store_matrix_sync(Cs + (size_t) warp * 16 * kTcCLd + n * 16, acc[n], kTcCLd, wmma::mem_row_major);
+        __syncthreads();
+        const int t = threadIdx.x / kTcRows, jj = threadIdx.x % kTcRows, j = base + jj;
+        if (t < nt && j < n_eff) {
+            const int nv = (pos[t0 + t] + 1) / ratio;
+            float s = -INFINITY;
+            if (j < nv) {
+                s = 0.f;
+#pragma unroll
+                for (int h = 0; h < kIdxHeads; ++h) s += fmaxf(Cs[(size_t) (t * kIdxHeads + h) * kTcCLd + jj], 0.f) * (wsh[t][h] * w_scale);
+            }
+            scores[(size_t) (t0 + t) * n_comp + j] = s;
+        }
     }
 }
 
@@ -1146,9 +1278,41 @@ void kv_window(const float* kv_raw, const float* norm_w, const int32_t* pos, int
 }
 
 namespace {
+// Whether the current device runs index_key_kernel's cluster form: compute capability 9.0 or up, in a build with code
+// for it. Otherwise index_key_block_kernel computes the same key.
+bool key_clusters() {
+#ifdef BASALT_ARCH_BELOW_SM90
+    return false;
+#else
+    static std::atomic<signed char> known[64];   // per device: 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    signed char k = known[dev].load(std::memory_order_acquire);
+    if (k == 0) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        k = major >= 9 ? 2 : 1;
+        known[dev].store(k, std::memory_order_release);
+    }
+    return k == 2;
+#endif
+}
+
 // The index keys of the groups the call closed.
 void index_keys(const CompressArgs& a, const float* pre, const int32_t* row_of, const int32_t* pos, int n_tokens,
                 cudaStream_t s) {
+    if (!key_clusters()) {
+        index_key_block_kernel<<<n_tokens, 256, 0, s>>>(pre, row_of, pos, a.ratio, a.rms_eps, a.w_idx_k, a.idx_k_norm_w,
+                                                        a.rope_freq, a.comp_ik, a.format == CacheFormat::Fp8);
+        check_launch("index_key");
+        return;
+    }
     index_key_kernel<<<dim3(kKeyBlocks, n_tokens), 32 * kKeyRows, 0, s>>>(pre, row_of, pos, a.ratio, a.rms_eps, a.w_idx_k,
                                                                           a.idx_k_norm_w, a.rope_freq, a.comp_ik,
                                                                           a.format == CacheFormat::Fp8);
@@ -1381,10 +1545,21 @@ void indexer_select_batch(const IndexerArgs& a, const float* qr, const float* x,
     const float w_scale = 1.0f / sqrtf((float) (kIdxHeads * kIdxDim));
     if (a.mode == IndexMode::Level2) mark_blocks_kernel<<<n_tokens, 256, 0, s>>>(a.cand_ids, a.cand_n, n_blk, pos, a.n_comp, a.ratio,
                                                           a.block_size, w.blk_ok);
-    dim3 grid(std::min((a.n_comp + 127) / 128, kScoreBlocks), n_tokens);
-    (a.format == CacheFormat::Fp8 ? idx_score_kernel<true> : idx_score_kernel<false>)<<<grid, 128, 0, s>>>(w.iq, w.iw, pos, a.comp_ik, a.n_comp, a.ratio,
-                                          a.block_size, a.mode == IndexMode::Level2 ? w.blk_ok : nullptr, n_blk,
-                                          w_scale, w.scores);
+    // the fp16 cache and Level2's candidate mask keep idx_score_kernel
+    if (a.format == CacheFormat::Fp8 && a.mode != IndexMode::Level2) {
+        static bool attr = false;
+        if (!attr) {
+            cudaFuncSetAttribute(idx_score_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcSmem);
+            attr = true;
+        }
+        dim3 g(std::min((a.n_comp + kTcRows - 1) / kTcRows, kTcScoreBlocks), (n_tokens + kTcTok - 1) / kTcTok);
+        idx_score_tc_kernel<<<g, kTcThreads, kTcSmem, s>>>(w.iq, w.iw, pos, n_tokens, a.comp_ik, a.n_comp, a.ratio, w_scale, w.scores);
+    } else {
+        dim3 grid(std::min((a.n_comp + 127) / 128, kScoreBlocks), n_tokens);
+        (a.format == CacheFormat::Fp8 ? idx_score_kernel<true> : idx_score_kernel<false>)<<<grid, 128, 0, s>>>(w.iq, w.iw, pos, a.comp_ik, a.n_comp, a.ratio,
+                                              a.block_size, a.mode == IndexMode::Level2 ? w.blk_ok : nullptr, n_blk,
+                                              w_scale, w.scores);
+    }
     check_launch("idx_score");
     if (a.mode == IndexMode::Level1) {
         dim3 g((n_blk + 127) / 128, n_tokens);

@@ -33,6 +33,7 @@
 
 #include "basalt/core/checkpoint_regions.hpp"
 #include "basalt/core/conversation_cache.hpp"
+#include "basalt/core/elastic_array.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/models/inkling2/dspark_kernels.hpp"
@@ -48,6 +49,10 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+namespace basalt::prefill::mmq {
+class Context;
+}
 
 namespace basalt::models::inkling2 {
 
@@ -105,7 +110,10 @@ private:
 model::Result dspark_plan(const Pack& pack, core::LoadPlan& reads, int file, int device, std::unique_ptr<DsparkWeights>& out);
 
 /// The device bytes a session's drafter takes for `context` positions with a tap of `tap_rows` rows (0 without a drafter).
-uint64_t dspark_session_bytes(const Pack& pack, int64_t context, int tap_rows);
+/// A session's drafter bytes (its caches and its steps' scratch), the shared tap aside.
+uint64_t dspark_session_bytes(const Pack& pack, int64_t context);
+/// The tap of `tap_rows` rows: the target's features of a call's rows, which every session's commit reads (one shared).
+uint64_t dspark_tap_bytes(int tap_rows);
 
 /// What a session holds of the drafter: the tap the target fills, the drafter's caches and scratch, and the calls the session
 /// forwards. Without a drafter every call does nothing and draft_begin says the model has none.
@@ -115,15 +123,31 @@ public:
     /// `w` null: no drafter. `context` the session's positions; `tap_rows` the most rows one forward fills the tap with.
     /// `dump` (--diag-dump's directory, may be empty): every committed run's features and the first blocks' outputs (their
     /// final rows, every draft's logits, the drafts) go to dspark.bin there in order, to replay against a reference.
-    bool init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, const std::string& dump, std::string& err);
+    /// `tap`: the shared tap of `tap_rows` rows (dspark_tap_bytes). `backed` > 0: the full layers' caches reserve the context and
+    /// back only the cells of the first `backed` positions (and a block past them), growing with the target's (ensure).
+    bool init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, float* tap, const std::string& dump,
+              int64_t backed, std::string& err);
     bool on() const { return w_ != nullptr; }
     /// The tap slot visit `visit` fills with its input rows, or -1.
     int slot_of_visit(int visit) const;
     /// Slot k's rows (fp32, kWidth each, contiguous): slots 0..2 the visits' inputs, slot 3 the final normed state.
     float* tap(int slot) const { return tap_ + (size_t) slot * tap_rows_ * kWidth; }
+    /// Caller-owned chunk buffers reused by commit_prompt() (no extra device allocation).
+    struct PromptScratch {
+        float* mix = nullptr;         ///< [3][rows][kWidth]
+        float* kb = nullptr;          ///< [rows][kKvHeads * kHeadDim]
+        float* vb = nullptr;          ///< [rows][kKvHeads * kHeadDim]
+        void* xq = nullptr;           ///< MMQ q8_1 rows for [rows][kWidth]
+        int32_t* pos3 = nullptr;      ///< [rows][3]
+        const int32_t* bounds = nullptr;  ///< {0, rows}
+        const int32_t* ident = nullptr;   ///< 0..rows-1
+    };
     /// Enqueues the context keys and values of the forward's `rows` rows (positions pos_d[0..rows), contiguous, on the
     /// device) from the tap. Only fixed addresses: a captured forward may hold it.
-    void commit(const int32_t* pos_d, int rows, void* stream);
+    /// The context of `rows` rows from the tap's rows row0.. (a batch window's segment starts past row 0).
+    void commit(const int32_t* pos_d, int rows, void* stream, int row0 = 0);
+    /// Batched commit for prompt chunks: runs dspark_mix once and projects k_ctx / v_ctx through MMQ.
+    void commit_prompt(const int32_t* pos_d, int rows, basalt::prefill::mmq::Context& mmq, const PromptScratch& s, void* stream);
     /// The host's record of the same rows (outside a captured forward).
     void note(int64_t pos0, int rows);
     model::Result draft_begin(int32_t anchor, int64_t pos, int n, void* stream);
@@ -132,6 +156,28 @@ public:
     size_t running_bytes() const;
     void running_regions(core::RunningState& st) const;
     size_t cells_bytes(int64_t positions) const;
+    /// The elastic caches (init's `backed`): the device bytes ensure(positions) maps, backing the cells of `positions`
+    /// positions and a block past them; trim gives back what lies past them.
+    uint64_t grow_bytes(int64_t positions) const;
+    bool ensure(int64_t positions, std::string& err);
+    void trim(int64_t positions);
+    int64_t backed_cells() const { return backed_cells_; }
+    bool usable() const {
+        for (const auto& a : full_)
+            if (!a->usable()) return false;
+        return true;
+    }
+    /// The last ensure failed only because the device lacked the memory.
+    bool out_of_memory() const {
+        for (const auto& a : full_)
+            if (a->out_of_memory()) return true;
+        return false;
+    }
+    uint64_t backing_bytes() const {
+        uint64_t n = 0;
+        for (const auto& a : full_) n += a->backed();
+        return n;
+    }
     bool save_cells(std::vector<core::ConversationKv>& kv, int64_t positions, void* stream) const;
     /// Restores from kv[at..]; `at` moves past what it read. False when kv holds no drafter cells of that shape.
     bool restore_cells(const std::vector<core::ConversationKv>& kv, size_t& at, int64_t positions, void* stream);
@@ -143,11 +189,14 @@ private:
         bool ring = false;
     };
     void* dev(size_t bytes, bool& ok);
+    void count_backed();                    ///< backed_cells_ from the elastic caches
     void stage(int k, int n, void* stream);
     bool stage_graph(int k, int n, void* stream);
     const DsparkWeights* w_ = nullptr;
     std::vector<void*> allocs_, pinned_;
     std::vector<Cache> cache_;
+    std::vector<std::unique_ptr<core::ElasticArray>> full_;   ///< the full layers' K and V when elastic
+    int64_t backed_cells_ = 0;              ///< cells every full layer's cache backs
     std::vector<int> slot_;                 ///< by visit
     int tap_rows_ = 0;
     int64_t context_ = 0;
@@ -156,6 +205,7 @@ private:
     float* mix_ = nullptr;                  ///< [3][8][width]
     float* fr_ = nullptr;                   ///< the Markov head's context by position: [kFrRing][width]
     int32_t* pos3_ = nullptr;               ///< [8][3]
+    int32_t* ring_bounds_ = nullptr;        ///< {0, ring_cells} for batched sliding-window commits
     float *kb_ = nullptr, *vb_ = nullptr;   ///< [8][1024]
     void* act_ = nullptr;                   ///< q8_1 rows
     // block
