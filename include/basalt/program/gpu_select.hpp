@@ -46,7 +46,7 @@ bool parse_gpu_spec(const std::string& text, GpuSpec& out, std::string& err);
 /// Parses "" (One) or "peer", "split" or "tensor"; false with `err` for anything else.
 bool parse_gpu_mode(const std::string& text, GpuMode& out, std::string& err);
 
-/// Whether the card can be the main card: compute capability 12.0 or 8.9, or unknown (nothing to check against).
+/// Whether the card can be the main card: compute capability 12.0, 8.9 or 8.6, or unknown (nothing to check against).
 bool gpu_main_supported(const GpuCard& c);
 /// Whether the card can be a second card: the same rule as the main card (the build's architectures are checked at
 /// start, build_archs.hpp).

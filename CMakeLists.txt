@@ -42,26 +42,30 @@ endfunction()
 # the CUDA language gives the .cu compile rules but not the imported targets, so `CUDA::cudart` is brought in
 # explicitly for the host-side programs that call the runtime themselves
 find_package(CUDAToolkit REQUIRED)
-# Two architectures: 120 (the full engine) and 89 (Ada, e.g. -DCMAKE_CUDA_ARCHITECTURES=89), where the kernels that
-# need thread-block clusters, bulk async copies or FP4 tensor cores are compiled out and their callers take the
-# plain kernels instead.
-if(PEER_ADA)
-  set(_basalt_has_89 FALSE)
+# Three architectures: 120 (the full engine), 89 (Ada, e.g. -DCMAKE_CUDA_ARCHITECTURES=89) and 86 (Ampere). Below 9.0
+# the kernels that need thread-block clusters, bulk async copies or FP4 tensor cores are compiled out and their callers
+# take the plain kernels instead; below 8.9 the same holds for the E4M3 conversion and the E4M3 tensor-core products.
+function(basalt_add_older_arch _number)
   foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
     string(REGEX REPLACE "[-a].*$" "" _base "${_a}")
-    if(_base STREQUAL "89")
-      set(_basalt_has_89 TRUE)
+    if(_base STREQUAL "${_number}")
+      return()
     endif()
   endforeach()
-  if(NOT _basalt_has_89)
-    list(APPEND CMAKE_CUDA_ARCHITECTURES 89)   # a normal variable over the cache entry: every target below takes it
-  endif()
+  # a normal variable over the cache entry: every target below takes it
+  set(CMAKE_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES};${_number}" PARENT_SCOPE)
+endfunction()
+if(PEER_ADA)
+  basalt_add_older_arch(89)
+endif()
+if(PEER_AMPERE)
+  basalt_add_older_arch(86)
 endif()
 set(_basalt_has_sm90 FALSE)
 foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[-a].*$" "" _base "${_a}")     # 120-real / 120a are still 120
-  if(NOT (_base STREQUAL "120" OR _base STREQUAL "89"))
-    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for compute capability 12.0 and 8.9 only")
+  if(NOT (_base STREQUAL "120" OR _base STREQUAL "89" OR _base STREQUAL "86"))
+    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for compute capability 12.0, 8.9 and 8.6 only")
   endif()
   if(_base STREQUAL "120")
     set(_basalt_has_sm90 TRUE)
@@ -72,15 +76,15 @@ if(NOT _basalt_has_sm90)
   add_compile_definitions($<$<COMPILE_LANGUAGE:CUDA>:BASALT_ARCH_BELOW_SM90=1>)
 endif()
 # The architectures of a target whose 12.0 code needs sm_120a's instructions (the block-scaled mma, the E2M1
-# conversions): 120a-real for a 120, 89-real for an 89, where the same files build their Ada kernels instead.  A 120-only
-# build gets 120a-real alone.
+# conversions): 120a-real for a 120, 89-real for an 89 and 86-real for an 86, where the same files build their older-card
+# kernels instead.  A 120-only build gets 120a-real alone.
 set(BASALT_CUDA_ARCHS_A "")
 foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[-a].*$" "" _base "${_a}")
   if(_base STREQUAL "120")
     list(APPEND BASALT_CUDA_ARCHS_A 120a-real)
   else()
-    list(APPEND BASALT_CUDA_ARCHS_A 89-real)
+    list(APPEND BASALT_CUDA_ARCHS_A ${_base}-real)
   endif()
 endforeach()
 list(REMOVE_DUPLICATES BASALT_CUDA_ARCHS_A)

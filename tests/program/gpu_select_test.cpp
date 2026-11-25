@@ -204,18 +204,18 @@ int main() {
     }
     // Four mixed cards, one of them not Blackwell: all takes them all and refuses the one that cannot run.
     {
-        const std::vector<GpuCard> v = {card(0, "RTX 5070 Ti", 12, 0, 896, 16), card(1, "RTX 3090", 8, 6, 936, 24),
+        const std::vector<GpuCard> v = {card(0, "RTX 5070 Ti", 12, 0, 896, 16), card(1, "RTX 2080 Ti", 7, 5, 616, 11),
                                         card(2, "RTX 5090", 12, 0, 1792, 32), card(3, "RTX 5060 Ti", 12, 0, 448, 16)};
-        CHECK_STR(pick("all", v, "peer").error, "gpu-mode peer: GPU 1 (RTX 3090) is sm_86; every card must be sm_120 or sm_89");
+        CHECK_STR(pick("all", v, "peer").error, "gpu-mode peer: GPU 1 (RTX 2080 Ti) is sm_75; every card must be sm_120, sm_89 or sm_86");
         CHECK_STR(pick("0,2,3", v, "peer").error, "");
         CHECK_STR(cards(pick("3,2,0", v, "split")), "3,2,0");
-        CHECK_STR(pick("0,1", v, "split").error, "gpu-mode split: GPU 1 (RTX 3090) is sm_86; every card must be sm_120 or sm_89");
-        CHECK_STR(pick("0,1", v, "tensor").error, "gpu-mode tensor: GPU 1 (RTX 3090) is sm_86; every card must be sm_120 or sm_89");
+        CHECK_STR(pick("0,1", v, "split").error, "gpu-mode split: GPU 1 (RTX 2080 Ti) is sm_75; every card must be sm_120, sm_89 or sm_86");
+        CHECK_STR(pick("0,1", v, "tensor").error, "gpu-mode tensor: GPU 1 (RTX 2080 Ti) is sm_75; every card must be sm_120, sm_89 or sm_86");
         GpuChoice c = pick("", v);
         CHECK_STR(cards(c), "0");
         CHECK_STR(c.warning, "GPU 2 (RTX 5090), GPU 3 (RTX 5060 Ti) unused; to use more cards set gpu (0,1 or all) and gpu-mode");
-        CHECK_STR(pick("1", v).error, "gpu 1: GPU 1 (RTX 3090) is sm_86; the main card must be sm_120 or sm_89");
-        CHECK_STR(pick("1,0", v, "peer").error, "gpu 1,0: GPU 1 (RTX 3090) is sm_86; the main card must be sm_120 or sm_89");
+        CHECK_STR(pick("1", v).error, "gpu 1: GPU 1 (RTX 2080 Ti) is sm_75; the main card must be sm_120, sm_89 or sm_86");
+        CHECK_STR(pick("1,0", v, "peer").error, "gpu 1,0: GPU 1 (RTX 2080 Ti) is sm_75; the main card must be sm_120, sm_89 or sm_86");
     }
     // An Ada (sm_89) card: a main card or a later card in every mode, as a Blackwell one (whether the build holds its
     // code is checked at start; check_gpu_modes refuses tensor for every model)
@@ -229,6 +229,18 @@ int main() {
         CHECK_STR(cards(pick("0,1", v, "peer")), "0,1");
         CHECK_STR(cards(pick("all", v, "peer")), "0,1");
     }
+    // An Ampere (sm_86) card follows the same rule: alone, as the main card of two, or a later card in every mode.
+    {
+        const std::vector<GpuCard> v = {card(0, "RTX 5090", 12, 0, 1792, 32), card(1, "RTX 3090", 8, 6, 936, 24)};
+        CHECK_STR(cards(pick("1", v)), "1");
+        CHECK_STR(cards(pick("1,0", v, "peer")), "1,0");
+        CHECK_STR(cards(pick("0,1", v, "peer")), "0,1");
+        CHECK_STR(cards(pick("all", v, "split")), "0,1");
+        const std::vector<GpuCard> pair = {card(0, "RTX 3090", 8, 6, 936, 24), card(1, "RTX 3090", 8, 6, 936, 24)};
+        CHECK_STR(cards(pick("", pair)), "0");
+        CHECK_STR(cards(pick("all", pair, "split")), "0,1");
+        CHECK_STR(cards(pick("0,1", pair, "peer")), "0,1");
+    }
     // A laptop's own card beside a desktop card in an enclosure: the order is the user's, and unset is GPU 0 alone.
     {
         const std::vector<GpuCard> v = {card(0, "RTX 5080 Laptop GPU", 12, 0, 896, 16), card(1, "RTX 5090", 12, 0, 1792, 32)};
@@ -238,9 +250,9 @@ int main() {
     }
     // A first card Basalt cannot run: unset is an error.
     {
-        const std::vector<GpuCard> v = {card(0, "RTX 3090", 8, 6, 936, 24), card(1, "RTX 5090", 12, 0, 1792, 32)};
-        CHECK_STR(pick("", v).error, "gpu 0: GPU 0 (RTX 3090) is sm_86; the main card must be sm_120 or sm_89");
-        CHECK_STR(pick("all", v, "peer").error, "gpu all: GPU 0 (RTX 3090) is sm_86; the main card must be sm_120 or sm_89");
+        const std::vector<GpuCard> v = {card(0, "RTX 2080 Ti", 7, 5, 616, 11), card(1, "RTX 5090", 12, 0, 1792, 32)};
+        CHECK_STR(pick("", v).error, "gpu 0: GPU 0 (RTX 2080 Ti) is sm_75; the main card must be sm_120, sm_89 or sm_86");
+        CHECK_STR(pick("all", v, "peer").error, "gpu all: GPU 0 (RTX 2080 Ti) is sm_75; the main card must be sm_120, sm_89 or sm_86");
         CHECK_STR(cards(pick("1", v)), "1");
     }
     // No card list (no management library, no CUDA_VISIBLE_DEVICES): numbers pass, all cannot run.
@@ -280,6 +292,9 @@ int main() {
         CHECK(basalt::arch_list_has("120", 12, 0) && !basalt::arch_list_has("120", 8, 9));
         CHECK(basalt::arch_list_has("120a-real,89-real", 12, 0) && basalt::arch_list_has("120a-real,89-real", 8, 9));
         CHECK(!basalt::arch_list_has("120,89", 8, 6) && !basalt::arch_list_has("120,89", 9, 0));
+        CHECK(basalt::arch_list_has("120,89,86", 8, 6) && basalt::arch_list_has("120a-real,89-real,86-real", 8, 6));
+        CHECK(basalt::arch_supported(12, 0) && basalt::arch_supported(8, 9) && basalt::arch_supported(8, 6));
+        CHECK(!basalt::arch_supported(8, 0) && !basalt::arch_supported(7, 5) && !basalt::arch_supported(9, 0));
         CHECK(!basalt::arch_list_has("", 12, 0) && !basalt::arch_list_has("1200", 12, 0));
         CHECK(basalt::build_has_arch(12, 0) == basalt::arch_list_has(basalt::build_archs(), 12, 0));
     }

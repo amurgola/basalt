@@ -11,6 +11,12 @@
 
 namespace basalt {
 
+/// Whether the engine has kernels for compute capability major.minor in some build: 12.0 (Blackwell), 8.9 (Ada) and
+/// 8.6 (Ampere). Whether this build holds them is build_has_arch's question.
+inline bool arch_supported(int major, int minor) {
+    return (major == 12 && minor == 0) || (major == 8 && (minor == 9 || minor == 6));
+}
+
 /// Whether the comma-separated architecture list `list` ("120,89"; a suffix such as "a" or "-real" after the number is
 /// ignored) holds compute capability major.minor: 120 is 12.0, 89 is 8.9.
 inline bool arch_list_has(const char* list, int major, int minor) {

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 
@@ -235,7 +236,7 @@ DeviceInfo device_info(int ordinal) {
     int count = 0;
     check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
     if (count == 0) {
-        throw CudaError("no CUDA device is present; basalt needs an NVIDIA GPU of compute capability 12.0 or 8.9", -1);
+        throw CudaError("no CUDA device is present; basalt needs an NVIDIA GPU of compute capability 12.0, 8.9 or 8.6", -1);
     }
     if (ordinal < 0 || ordinal >= count) {
         throw CudaError("device ordinal " + std::to_string(ordinal) + " is out of range (have " +
@@ -261,12 +262,12 @@ DeviceInfo device_info(int ordinal) {
     check(cudaDriverGetVersion(&d.driver_version), "cudaDriverGetVersion");
     check(cudaRuntimeGetVersion(&d.runtime_version), "cudaRuntimeGetVersion");
 
-    // The binary holds code for compute capability 12.0 and 8.9 only; a card of another compute capability is refused
+    // The engine has code for compute capability 12.0, 8.9 and 8.6 only; a card of another compute capability is refused
     // here rather than failing at its first kernel launch.
-    const bool cc_ok = (d.cc_major == 12 && d.cc_minor == 0) || (d.cc_major == 8 && d.cc_minor == 9);
+    const bool cc_ok = basalt::arch_supported(d.cc_major, d.cc_minor);
     if (!cc_ok) {
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) + "." +
-                            std::to_string(d.cc_minor) + "; basalt needs an NVIDIA GPU of compute capability 12.0 or 8.9",
+                            std::to_string(d.cc_minor) + "; basalt needs an NVIDIA GPU of compute capability 12.0, 8.9 or 8.6",
                         -1);
     }
     // and only for the architectures it was built for (build_archs.hpp): another one would run lower PTX with the
@@ -274,7 +275,7 @@ DeviceInfo device_info(int ordinal) {
     if (!basalt::build_has_arch(d.cc_major, d.cc_minor)) {
         throw CudaError("device " + d.name + " is sm_" + std::to_string(d.cc_major) + std::to_string(d.cc_minor) +
                             " and this build has device code for " + basalt::build_archs() +
-                            " only; build with -DCMAKE_CUDA_ARCHITECTURES=\"120;89\" for Blackwell and Ada cards together",
+                            " only; build with -DCMAKE_CUDA_ARCHITECTURES=\"120;89;86\" for Blackwell, Ada and Ampere cards together",
                         -1);
     }
     return d;
