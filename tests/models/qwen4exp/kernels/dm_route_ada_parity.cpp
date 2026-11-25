@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
     CK(cudaGetDevice(&dev));
     CK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
     CK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev));
-    if (major != 8 || minor != 9) { std::printf("dm_route_ada_parity: not compute capability 8.9\n"); return 77; }
+    if (major != 8 || (minor != 9 && minor != 6)) { std::printf("dm_route_ada_parity: not compute capability 8.9 or 8.6\n"); return 77; }
 
     std::mt19937 rng(31);
     std::normal_distribution<float> nd(0.f, 1.f);

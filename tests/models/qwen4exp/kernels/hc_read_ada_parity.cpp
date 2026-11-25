@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
     CK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
     CK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev));
     CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
-    if (major != 8 || minor != 9) { std::printf("hc_read_ada_parity: not compute capability 8.9\n"); return 77; }
+    if (major != 8 || (minor != 9 && minor != 6)) { std::printf("hc_read_ada_parity: not compute capability 8.9 or 8.6\n"); return 77; }
     K::hc_read_ada_enable(true);
     K::hc_read_ada_init();
     std::mt19937 rng(29);

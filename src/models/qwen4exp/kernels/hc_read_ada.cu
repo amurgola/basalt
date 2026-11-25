@@ -569,7 +569,7 @@ AdaDev& ada_dev() {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        d.ada = major == 8 && minor == 9;
+        d.ada = major == 8 && (minor == 9 || minor == 6);
     }
     return d;
 }

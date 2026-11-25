@@ -522,8 +522,8 @@ void run_bench(std::mt19937& rng) {
 
 int main(int argc, char** argv) {
     cudaDeviceProp prop{};
-    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess || prop.major * 10 + prop.minor < 89) {
-        std::printf("SKIP: requires compute capability 8.9 (the cp.async kernel) or 12.x (TMA)\n");
+    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess || prop.major * 10 + prop.minor < 86) {
+        std::printf("SKIP: requires compute capability 8.6 or 8.9 (the cp.async kernel) or 12.x (TMA)\n");
         return 77;
     }
     std::printf("GPU: %s (sm_%d%d, %d SMs)\n", prop.name, prop.major, prop.minor, prop.multiProcessorCount);

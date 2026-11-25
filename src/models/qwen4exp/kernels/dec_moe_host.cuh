@@ -10,7 +10,7 @@ bool g_dm_ada_on = false;
 bool g_dm_ada_stage = false;
 
 bool dm_ada_device() {
-    static signed char known[16] = {};   // 0: not asked yet, 1: compute capability 8.9, -1: another
+    static signed char known[16] = {};   // 0: not asked yet, 1: compute capability 8.9 or 8.6, -1: another
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= 16) return false;
@@ -18,7 +18,7 @@ bool dm_ada_device() {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        known[dev] = major == 8 && minor == 9 ? 1 : -1;
+        known[dev] = major == 8 && (minor == 9 || minor == 6) ? 1 : -1;
     }
     return known[dev] > 0;
 }

@@ -1142,7 +1142,7 @@ const DevInfo& dev_info() {
             cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
             cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
             d.sms = sms;
-            d.ok = major == 8 && minor == 9 && optin >= SMEM + 1024 &&
+            d.ok = major == 8 && (minor == 9 || minor == 6) && optin >= SMEM + 1024 &&
                    cudaMalloc((void**) &d.t10, ((size_t) NE + (size_t) sms * 2 * KT) * 4) == cudaSuccess &&
                    cudaMalloc((void**) &d.cn, (size_t) NSLOT * CN_SLOT * 4) == cudaSuccess &&
                    cudaMalloc((void**) &d.lg, (size_t) NSLOT * MAXT * NE * 8) == cudaSuccess &&

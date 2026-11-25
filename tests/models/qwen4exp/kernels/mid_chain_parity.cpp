@@ -305,8 +305,8 @@ int main(int argc, char** argv) {
         CK(cudaGetDevice(&dev));
         CK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
         CK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev));
-        if (major == 8 && minor == 9) {
-            if (hold_ms >= 0) { std::printf("mid_chain_parity --hold: not on compute capability 8.9\n"); return 77; }
+        if (major == 8 && (minor == 9 || minor == 6)) {
+            if (hold_ms >= 0) { std::printf("mid_chain_parity --hold: not on compute capability 8.9 or 8.6\n"); return 77; }
             return ada_main(iters);
         }
     }
