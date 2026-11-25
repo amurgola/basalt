@@ -1,8 +1,8 @@
 name: release
 
 # A published release gets one archive per platform, built from the release's tag and attached to it.
-# This fork's archives carry both older-peer options, so an RTX 40 or RTX 30 series card can be the expert tier
-# beside a Blackwell main card.
+# This fork's archives carry both older-card options (three architectures: 120, 89 and 86), so an RTX 40 or RTX 30
+# series card can be the only card, the main card or a second card.
 # workflow_dispatch rebuilds the archives of an existing release (`tag` is its tag, e.g. v0.3.1).
 # Releases made with the workflow's own GITHUB_TOKEN do not start workflows; create them with a user token (`gh release`).
 on:

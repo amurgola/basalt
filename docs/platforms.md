@@ -3,8 +3,9 @@
 Linux x64 and Windows x64, NVIDIA Blackwell (sm_120). Linux is where the engine is tested and benchmarked. CI builds both and runs
 the CPU tests on each. The GPU tests and the quality gate need a card.
 
-This fork also runs every path on sm_89 (Ada), as the only card, the main card or a second card, in a build that holds
-sm_89 code ([GPUs](configuration/gpus.md#an-ada-sm_89-card), [Ada port notes](../ADA_PORT_NOTES.md)); every other
+This fork also runs every path on sm_89 (Ada) and sm_86 (Ampere), as the only card, the main card or a second card, in a
+build that holds that card's code ([an Ada card](configuration/gpus.md#an-ada-sm_89-card),
+[an Ampere card](configuration/gpus.md#an-ampere-sm_86-card), [Ada port notes](../ADA_PORT_NOTES.md)); every other
 architecture is refused.
 
 | | Linux | Windows |

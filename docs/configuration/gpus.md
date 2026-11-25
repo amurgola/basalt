@@ -14,8 +14,9 @@ in `basalt` itself, in `basalt-bench` and in `basalt-probe`.
 
 - Cards are numbered as `nvidia-smi` numbers them. The first card listed is the main card; `all` is every visible card in order, so
   GPU 0 is the main card. When `CUDA_VISIBLE_DEVICES` is set, the numbers count within its list.
-- On this fork every card, the main card included, may be Blackwell (sm_120) or Ada (sm_89), in every mode, when the build holds
-  its code ([an Ada card](#an-ada-sm_89-card)); any other card stops the start with an error.
+- On this fork every card, the main card included, may be Blackwell (sm_120), Ada (sm_89) or Ampere (sm_86), in every mode, when
+  the build holds its code ([an Ada card](#an-ada-sm_89-card), [an Ampere card](#an-ampere-sm_86-card)); any other card stops the
+  start with an error.
 - A number past the visible cards or a card listed twice stops the start with an error.
 - **Idle cards:** with `gpu` unset and more cards visible, every model warns once at start (`GPU 1 (RTX 5060 Ti) unused; to use
   more cards set gpu (0,1 or all) and gpu-mode`), in the CLI, the server and the bench. It is a warning, not an error. Naming a
@@ -131,14 +132,64 @@ callers take plain kernels ([Ada port notes](../../ADA_PORT_NOTES.md)). Upstream
 Flash-Next's peer kernels for sm_89 and refuses an Ada main card, `split` and the other models' peers; here none of that
 is refused. On a Blackwell + Ada pair:
 
-- Flash-Next: both cards read NVFP4 prompts through MMQ (its FP4 prompt kernels run only when every card is 12.x), so
-  the buffers, chunk plan and row rounding are the same on both. Its decode does not use FP4 tensor cores.
+- Flash-Next, `split`: both cards read NVFP4 prompts through MMQ (its FP4 prompt kernels run only when every card that
+  reads prompt layers is 12.x), so the buffers, chunk plan and row rounding are the same on both. Its decode does not
+  use FP4 tensor cores.
+- Flash-Next, `peer` with a Blackwell main card: the older tier card reads no prompt layers (the start prints `prompt
+  split: off (a tier card has no FP4 tensor cores, so the main card reads every layer)`), the main card keeps its FP4
+  prompt kernels, and the tier card computes its experts' rows of a chunk through MMQ.
 - DeepSeek and Hy4-flash take an Ada main card or peer: their kernels build for 8.9 as they are (DeepSeek's parity
   tests pass here). No pack of either has been run here.
 - Inkling 2 Mini runs on an Ada card alone (both packs run here). In `split` or `peer` each card picks its own prompt
   kernels (FP4 experts only on 12.x, the Q8_0 projections and MXFP8 experts in their 8.9 forms).
 - Not run here: no second card was available, so every two-card mode has been checked only by the parity tests and
   with the 4090 alone running the `"120;89"` binary.
+
+## An Ampere (sm_86) card
+
+An Ampere card (RTX 30 series, RTX A2000 to A6000) follows the Ada card's rule: the only card, the main card or any later
+card, in every mode a model runs, in a build that holds sm_86 code (`-DPEER_AMPERE=ON` adds 86 to
+`CMAKE_CUDA_ARCHITECTURES`; this fork's release archives are built for `"120;89;86"`). sm_80 cards (A100) are refused: the
+build holds no code for them. An 8.6 pass takes the 8.9 kernels, with three differences, because Ampere has neither the
+E4M3 conversion nor E4M3 tensor cores:
+
+- E4M3 codes become f16 or bf16 in software (`narrow_bf16.cuh`: the bits moved into an f32 and the exponent rebiased by
+  one multiply), exact, checked on every input by `narrow_bf16_parity`.
+- The dense FP4 prompt product (`fp4_dense`'s `kernel_ada`) sums each 16-value scale group on the INT8 tensor cores: the
+  operands hold twice each E2M1 code, so the s32 sum is four times the group's and exact, and a quarter of it is the number
+  8.9's E4M3 tensor cores give. Every later operation is the same, so an Ampere card's prompt rows are an Ada card's bits.
+- The FP8 prompt product (`fp8_gemm`) decodes its codes in software before the same f16 product.
+
+Measured on one RTX 3090 on Windows (24 GB, a PCIe 4.0 x2 slot, the `"120;89;86"` binary, CUDA 13.0):
+
+- GPU tests on the card alone: every test passes except the five that fail on an RTX 4090 too (`file_expert_repin_test`,
+  `gdn_head_split_parity`, `dense_ops_parity`'s old baseline, `ds41_vision_reserve_test`, and `prefill_mmq_mxfp4_test`'s
+  IQ2_XS / IQ2_S rows at the same 2.96e-4) and `prefill_hc_up_mix_test` at 129 tokens, where cuBLAS, the test's
+  reference, sums in another order on this card (the kernel is bitwise at every other width, position independent, and
+  2.6e-7 from the double reference). The persistent 8.9 kernels (`dm_route_ada_parity`, `hc_read_ada_parity`,
+  `hc_fused_ada_parity`, `mid_chain_parity`, `q8_gemm_test`) pass bitwise on 8.6.
+- Qwen3.8-27B (NVFP4 pack, 32,768 context, INT8 KV): 16.0 GiB on the card and 2.4 GiB of RAM, loaded in 5.7 s, card peak
+  20.2 GiB. Decode with the block drafter 69 to 95 tok/s on chat prompts and 173 to 182 on JSON, 31 without it; a cold
+  14,000 or 28,000-token prompt reads at 1,040 to 1,090 tok/s. Sleep (`--idle-sleep`, `POST /v1/sleep`) frees the card in
+  7.0 s and wakes in 6.8 s over that x2 slot, and the next reply is correct.
+- Inkling 2 Mini (NVFP4-DQ8 pack, 32,768 context, fp16 KV): 16.2 GiB on the card and 0.9 GiB of RAM. Decode 150 to 168
+  tok/s on chat prompts and 212 to 215 on JSON; cold prompts read at 3,940 to 4,000 tok/s.
+- Flash-Next (NVFP4-DQ6_K pack, 32,768 context, fp16 KV) on the RTX 3090 alone: 20.7 GiB on the card, 47.7 GiB of RAM.
+  Decode 33 to 53 tok/s; cold prompts read at 750 (14,000 tokens) and 1,290 tok/s (28,000).
+- The same binary on an RTX 5090 (the Blackwell half, which the Ada port had not run): Qwen3.8-27B decodes at 200 to
+  281 tok/s on chat prompts and 514 to 538 on JSON and reads cold prompts at 13,700 to 14,900 tok/s, and Flash-Next
+  alone reads them at 5,640 and 8,050 tok/s: the figures of the 0.5.5 build on that card. Of its GPU tests, four of
+  the 4090's known ones fail (`file_expert_repin_test`, `gdn_head_split_parity`, `ds41_vision_reserve_test`,
+  `prefill_mmq_mxfp4_test`), and so do `ds41_router_parity`, `ds41_attn_index_parity`, `ds41_dspark_parity` and
+  `gqa_attn_parity`: their frozen hashes for 9.0 and up were taken on Linux, and on Windows the router's hash on the
+  5090 is the value the tests hold for a 4090 (the inputs come from the standard library's distributions).
+- Open: `dec_moe_parity --nvfp4` stops at its TMA kind on the 5090 with this binary (`dec_moe_vram: formats 40 / 40`:
+  the TMA expert kernel reports no blocks) and passes in a 120-only build of the same source. The engine never selects
+  that kernel (`vram` is -1 in `expert_resources.cpp`); the cause has not been found.
+- RTX 5090 main card with the RTX 3090 as Flash-Next's tier (`gpu 0,1`, `gpu-mode peer`): 8,569 experts on the 3090,
+  decode 114 to 168 tok/s, cold prompts 4,415 and 6,496 tok/s (the 0.5.6 build of this fork: 5,190 and 7,930).
+- Not run: two Ampere cards, an Ampere main card with a Blackwell tier, `split` over unlike cards, the Hy4-flash and
+  DeepSeek packs on 8.6 (their kernel tests pass), a pack with F8_E4M3 projections, and Linux.
 
 Three or more cards are community-tested: the path is checked on two cards. Reports from machines with three or four cards are
 welcome ([community](../community.md)).
