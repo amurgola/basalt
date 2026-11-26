@@ -188,8 +188,15 @@ Measured on one RTX 3090 on Windows (24 GB, a PCIe 4.0 x2 slot, the `"120;89;86"
   that kernel (`vram` is -1 in `expert_resources.cpp`); the cause has not been found.
 - RTX 5090 main card with the RTX 3090 as Flash-Next's tier (`gpu 0,1`, `gpu-mode peer`): 8,569 experts on the 3090,
   decode 114 to 168 tok/s, cold prompts 4,415 and 6,496 tok/s (the 0.5.6 build of this fork: 5,190 and 7,930).
-- Not run: two Ampere cards, an Ampere main card with a Blackwell tier, `split` over unlike cards, the Hy4-flash and
-  DeepSeek packs on 8.6 (their kernel tests pass), a pack with F8_E4M3 projections, and Linux.
+- Two RTX 3090s (a second machine: Ryzen 9 5900X, 16 GB of RAM, the cards on x8 and x4 links, Windows 11), Qwen3.8-27B,
+  INT8 KV. One card at 32,768: decode 73 to 102 tok/s on chat prompts and 187 to 192 on JSON, cold prompts 1,170 to
+  1,190 tok/s. `gpu 0,1` with `gpu-mode split` at 131,072: 8.4 and 7.6 GiB of weights, 12.4 and 12.5 GiB used, decode
+  77 to 106 and 195 to 199 tok/s, cold prompts 1,620 (14,000 tokens) and 1,800 tok/s (28,000). At 262,144 the split
+  takes 14.2 and 15.0 GiB and answers. `gpu-mode peer` does not start there (`out of page-locked memory for the token
+  embedding`): its page-locked buffers and the 2.4 GiB embedding do not fit 16 GB of RAM. Sleep is refused for the same
+  reason (`the model stays awake (RAM: 4411 MiB free, 31088 MiB of GPU state to hold and 8192 MiB to keep)`).
+- Not run: an Ampere main card with a Blackwell tier, `split` over unlike cards, `peer` on two older cards with enough
+  RAM, the Hy4-flash and DeepSeek packs on 8.6 (their kernel tests pass), a pack with F8_E4M3 projections, and Linux.
 
 Three or more cards are community-tested: the path is checked on two cards. Reports from machines with three or four cards are
 welcome ([community](../community.md)).
