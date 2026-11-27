@@ -194,6 +194,7 @@ private:
         }
         for (const TensorInfo& t : gg.tensors()) tensors_[t.name] = t;
         dense::Options o = run_options(gg, req.max_context, req.sessions, req.spec, req.draft, req.vision, req.kv, req.kv_resident);
+        o.exact_tail = req.exact_tail;
         const bool want_block = o.drafter == dense::Drafter::Block, want_mtp = o.drafter == dense::Drafter::Mtp;
         dense::BlockDrafter bd_meta;
         if (want_block && !block_meta(gg, bd_meta, g.n_embd, err)) return false;
@@ -676,6 +677,7 @@ public:
         else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--kv") o.kv = args.next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(args.next("--kv-resident"));
+        else if (a == "--exact-tail") o.exact_tail = std::atoll(args.next("--exact-tail"));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
         else return false;
@@ -701,6 +703,11 @@ public:
         if (o.kv_resident < 0) {
             basalt::log::error("basalt qwen35", "--kv-resident %lld: cells per attention layer kept in VRAM, or 0 (all)",
                                (long long) o.kv_resident);
+            return 2;
+        }
+        if (o.exact_tail < 0) {
+            basalt::log::error("basalt qwen35", "--exact-tail %lld: the prompt's last tokens read in decode windows, or 0 (none)",
+                               (long long) o.exact_tail);
             return 2;
         }
         if (o.spec_given && (o.spec < 0 || o.spec > 16)) {

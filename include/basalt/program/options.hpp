@@ -53,6 +53,9 @@ struct CommonOptions {
     /// --kv-resident N: K/V streaming, N cells of each attention layer in VRAM and the rest in page-locked RAM (0: all in
     /// VRAM), for the models that take it
     int64_t kv_resident = 0;
+    /// --exact-tail N: the prompt's last N tokens are read in decode windows (BF16 rows into every product) instead of
+    /// prompt chunks (an NVFP4 matrix's rows rounded to FP4), for the models that take it; 0 = chunks only
+    int64_t exact_tail = 0;
     int diag_rows = 0;
     /// --diag-gpu-cut N: diagnostic, a two-card split's second card from layer N on, whatever the shares give (0: off)
     int diag_gpu_cut = 0;

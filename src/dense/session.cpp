@@ -4,6 +4,7 @@
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/suspendable.hpp"
+#include "basalt/dense/exact_tail.hpp"
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/log.hpp"
@@ -428,8 +429,38 @@ protected:
     }
 
 public:
+    // The request's tokens as prompt chunks, but those among the prompt's last --exact-tail as decode windows.
     Result prefill_chunk(const model::PrefillRequest& r) override {
         if (r.pos + r.n_tokens > m_.o.max_context) return fail(m_.o.arch + ": the prompt passes the context");
+        const int in_windows = exact_tail_rows(m_.o.exact_tail, r.n_tokens, tokens_after(r.total_tokens, r.n_tokens, r.rows_after));
+        if (in_windows == 0) return read_chunks(r);
+        model::PrefillRequest head = r;
+        head.n_tokens = r.n_tokens - in_windows;
+        if (head.n_tokens > 0) {
+            if (Result c = read_chunks(head); !c.ok()) return c;
+            if (r.stop && r.stop()) return {};
+        }
+        return read_windows(r, head.n_tokens);
+    }
+
+private:
+    // Tokens [from, n) of a prompt request as decode windows, each kept whole: every product reads BF16 rows, where a
+    // chunk rounds an NVFP4 matrix's rows to FP4.  The next call's settle commits the last one.
+    Result read_windows(const model::PrefillRequest& r, int from) {
+        for (int at = from; at < r.n_tokens;) {
+            model::DecodeRequest d;
+            d.tokens = r.tokens + at;
+            d.n_tokens = std::min(kWindow, r.n_tokens - at);
+            d.pos = r.pos + at;
+            if (Result w = decode_window(d); !w.ok()) return w;
+            at += d.n_tokens;
+            if (r.progress) r.progress(at);
+            if (at < r.n_tokens && r.stop && r.stop()) break;
+        }
+        return {};
+    }
+
+    Result read_chunks(const model::PrefillRequest& r) {
         if (Result s = settle(r.pos); !s.ok()) return s;
         if (m_.split && !drafter_) {   // the layer split: the chunks pipelined over the two cards
             std::string err;
@@ -457,6 +488,7 @@ public:
         return {};
     }
 
+public:
     bool reads_patches() const override { return m_.encoder != nullptr; }
 
     Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, model::ImageGrid& grid) override {

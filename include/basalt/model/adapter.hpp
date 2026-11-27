@@ -108,6 +108,7 @@ struct LoadRequest {
     RouteFlags route;                 ///< the lossy routing flags, for a model that takes them (route_flags.hpp)
     int64_t kv_resident = 0;          ///< --kv-resident: K/V cells per attention layer kept in VRAM (0: all)
     int diag_rows = 0;                ///< diagnostic: rows of one forward call of a prompt (0: the model's own chunk)
+    int64_t exact_tail = 0;           ///< --exact-tail: the prompt's last N tokens through decode windows (0: prompt chunks)
 };
 
 struct DecodeRequest {

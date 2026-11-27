@@ -87,6 +87,39 @@ The base scores 6.7411 on the same rows. Each chunk's first half is read as one 
 decoded against it, so every scored row sees a cache and recurrent state the prompt path wrote, W4A4 on the NVFP4 matrices at
 any chunk length (as the checkpoints and Infernix do). Decode never uses it.
 
+## The prompt's last tokens
+
+`--exact-tail N` reads the last N tokens of a prompt in decode windows (16 rows each, every one kept) instead of prompt
+chunks: their products take BF16 rows, and only the tokens before them are read W4A4. Off by default. With N at or past
+the prompt's length the session is the one `--diag-serial-prompt` leaves: three 730-token prompts gave its greedy reply
+token for token (95, 101 and 126 tokens); with N 0 they gave the stock build's.
+
+What it changes, measured on the published pack (every projection NVFP4), two RTX 3090s (350 W and 390 W) in `gpu-mode
+split`, `--max-context 131072 --kv fp16`, greedy, through the server. 24 requests "Make a plan and research <name>" for 24
+names the model has no knowledge of, a system prompt with two tools (`update_plan`, `web_search`), 729 to 734 prompt
+tokens, each followed to its first search. Counted: replies that state who the person is before any search, and first
+searches that carry words the request did not give.
+
+| `--exact-tail` | States an identity | Guessed search words |
+| ---: | ---: | ---: |
+| 0 | 7 of 24 | 2 of 24 |
+| 16 | 6 of 24 | 2 of 24 |
+| 32 | 5 of 24 | 3 of 24 |
+| 64 | 2 of 24 | 1 of 24 |
+| 128 | 2 of 24 | 0 of 24 |
+| 256 | 2 of 24 | 0 of 24 |
+| 1024 (the whole prompt) | 1 of 24 | 0 of 24 |
+
+One run per name and value. llama.cpp on unsloth's Q4_K_M and Q6_K of the same model gave 2 of 24 on the same requests,
+and NVIDIA's pack (FP8 GDN and attention projections, read W8A8) 2 of 24 on this engine with no tail. The user turn and
+the generation prompt are the last 20 tokens or so: reading only those exactly changes little, the gain comes when the
+tail reaches the end of the instructions before them.
+
+Cost, same cards, a cold one-shot read of 730 tokens: 0.93 s with N 0, 1.06 s with 64, 1.37 s with 256, 1.97 s with the
+whole prompt in windows. A window of 16 prompt rows takes about 27 ms there, about 580 tokens a second against 1,620 to
+1,800 for chunks. Decode is not touched. Not measured: an RTX 5090, a single card, prompts longer than 734 tokens, the
+MTP drafter, `--parallel` above 1.
+
 ## Two cards
 
 `gpu-mode peer` and `gpu-mode split` give the tokens of one card, greedy, at 65,536 context on conversation, struct, prose and a

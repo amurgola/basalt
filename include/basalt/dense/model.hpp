@@ -126,6 +126,9 @@ struct Options {
     /// read over the bus by every decode window and staged to the card for each prompt chunk (0, or at least max_context:
     /// all on the card)
     int64_t kv_resident = 0;
+    /// The prompt's last exact_tail tokens go through decode windows, whose products read BF16 rows, instead of prompt
+    /// chunks, which round an NVFP4 matrix's rows to FP4 (0: every token but the last through chunks)
+    int64_t exact_tail = 0;
     /// The layers this card holds and runs, [layer_begin, layer_end) (layer_end 0: to the last); its sessions keep the cells
     /// and recurrent state of those layers only.
     int layer_begin = 0, layer_end = 0;

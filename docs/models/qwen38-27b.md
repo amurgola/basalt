@@ -61,6 +61,13 @@ width from the pack; the GDN and attention kernels are shared with Flash-Next.
   (default drafting, a book's summary, an RTX 5090 at 400 W, interleaved runs against the build before): 108 to 122 tok/s at
   131K and 70 to 86 at 250K with `--kv int8`, 107 to 116 at 131K with `--kv fp16`; `--spec 0` at 250K, 44 to 51. The tokens are
   identical.
+- **The prompt's last tokens:** `--exact-tail N` (default 0, off) reads the last N tokens of each prompt in decode windows of
+  16 rows instead of prompt chunks, so their products take BF16 rows where a chunk rounds an NVFP4 matrix's rows to FP4. It
+  matters on the published pack, whose every projection is NVFP4: on 730-token tool prompts about names the model does not
+  know, replies that state who the person is before searching fell from 7 of 24 to 2 of 24 with N 64 or more
+  ([precision](../precision/qwen38-27b.md#the-prompts-last-tokens)).
+  The server counts N back from the prompt's end, so a turn that continues from a checkpoint reads at most its new tokens in windows.
+  Picture rows stay in chunks.
 - **Slots:** `--parallel N` gives each slot its own cache and recurrent state (157 MiB). Slots share the weights.
 - **Cards:** one card by default; a second Blackwell card is `gpu-mode peer` (it reads long prompts) or `split` (it holds the
   later layers) ([cards](#cards)).
